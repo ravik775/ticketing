@@ -30,8 +30,13 @@ ticketing-ca        (ClusterIssuer)  signs all of these (RSA 2048, valid 90 days
    ├─ kong-edge       secret gateway/kong-edge-tls         WAF → Kong               (server)
    ├─ kong-client     secret gateway/kong-client-tls       Kong → ticket-service    (CLIENT identity, CN=kong-gateway)
    ├─ ticket-service  secret ticketing/ticket-service-tls  Kong → ticket-service    (server)
-   └─ keycloak        secret auth/keycloak-tls             Kong / ticket-service → Keycloak (server)
+   ├─ keycloak        secret auth/keycloak-tls             Kong / ticket-service → Keycloak (server; also
+   │                                                        names "localhost" for the admin tunnel, guide 1.2)
+   └─ openbao         secret secrets/openbao-tls           External Secrets → OpenBao (server)
 ```
+
+After a renewal, OpenBao and Keycloak pick up the new certificate on restart
+(`kubectl -n secrets rollout restart statefulset/openbao`, `kubectl -n auth rollout restart deploy/keycloak`).
 
 Each secret contains three files: `tls.crt` (the certificate), `tls.key` (the private key) and `ca.crt`
 (the root CA certificate, used to verify the other side).

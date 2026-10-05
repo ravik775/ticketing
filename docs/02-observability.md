@@ -14,10 +14,12 @@ add when the platform grows.
 | **Kubernetes events** – restarts, scheduling, probe failures | Yes | `kubectl get events` |
 | **Certificate events** – issued/renewed | Yes | `kubectl describe certificate` |
 | **Business events** – ticket history (created, claimed, approved …) | Yes | the app UI, the API, MongoDB |
-| **Login events** – sign-ins, failed passwords | Off by default | enable in Keycloak (section 2.6) |
-| **Resource metrics** – CPU / memory per pod | Yes (current values only) | `kubectl top` |
-| **Metrics history / dashboards / alerts** | **No** | add Prometheus + Grafana (section 2.7) |
-| **Distributed traces** (timing of each hop) | **No** | add OpenTelemetry (section 2.7) |
+| **Login events** – sign-ins, failed passwords, admin changes | Yes | Keycloak log → Loki (section 2.6) |
+| **Kubernetes audit** – who read a secret, who ran `exec` | Yes | API server audit log → Loki |
+| **Resource metrics** – CPU / memory per pod | Yes | `kubectl top`, Prometheus history |
+| **Metrics history / dashboards / alerts** | Yes | Prometheus + Grafana + Alertmanager (section 2.7) |
+| **Central log search** | Yes | Loki, searched from Grafana *Explore* (section 2.7) |
+| **Distributed traces** (timing of each hop) | Yes | Tempo, from Kong and ticket-service (section 2.7) |
 
 ## 2.2 Logs
 
@@ -149,12 +151,13 @@ rejected, more details requested, responded), with who did it, when and the comm
 each ticket in the UI, returned by the API in the `events` field, and stored in MongoDB (see
 [guide 3](03-database-investigation.md#33-mongodb-ticket-details-and-history)).
 
-**Login events (Keycloak)** are switched off by default. To record sign-ins and failed passwords:
+**Login events (Keycloak)** are switched on for the `ticketing` and `master` realms by
+`scripts/configure-keycloak-audit.sh` (run by `up.sh`): user events and admin events are saved for 30 days
+and also written to the Keycloak log, from where they reach Loki and the alert rules.
 
-1. Admin console → realm **ticketing** → **Realm settings** → **Events** tab.
-2. **User events settings** → switch **Save events** on, choose an expiration (e.g. 30 days) → **Save**.
-3. Optionally **Admin events settings** → **Save events** on (records changes made by administrators).
-4. To view them: left menu → **Events** → *User events* (filter by user, type `LOGIN_ERROR`, date).
+* In the admin console (guide 1.2): left menu → **Events** → *User events* (filter by user, type
+  `LOGIN_ERROR`, date) or *Admin events*.
+* In Grafana *Explore* (Loki): `{namespace="auth", container="keycloak"} |= "LOGIN_ERROR"`.
 
 Keycloak already protects accounts from password guessing (*brute force detection* is on): after
 repeated failures an account is temporarily locked. Locked users are visible under the user →
@@ -176,19 +179,50 @@ a pod that reaches its limit is killed and restarted (`OOMKilled`).
 **Rate-limit usage of a user:** every `/api` response carries `X-RateLimit-Limit-Minute` and
 `X-RateLimit-Remaining-Minute` (the limit is 300 requests per minute per user).
 
-**What to add for history, dashboards, alerts and traces** (not installed today):
+**Per-tenant quota:** a tenant over its limit gets **429** with `Retry-After` and
+`X-Tenant-RateLimit-*` headers. Daily usage per tenant is in PostgreSQL:
+`kubectl -n ticketing exec postgres-0 -c postgres -- psql -U postgres -d ticketing -c "select * from tenant_usage order by day desc limit 20"`.
 
-| Need | Recommended addition |
+### The observability stack (namespace `observability`)
+
+| Component | Job |
 |---|---|
-| Metrics history + dashboards | Prometheus + Grafana (e.g. the `kube-prometheus-stack` Helm chart) |
-| Gateway metrics (requests, latency, status codes per route) | Kong `prometheus` plugin (free in Kong OSS) |
-| Java service metrics (JVM, HTTP, DB pool) | `spring-boot-starter-actuator` + `micrometer-registry-prometheus` |
-| WAF metrics | nginx `stub_status` endpoint or an nginx exporter |
-| Distributed traces | OpenTelemetry: Kong `opentelemetry` plugin + `micrometer-tracing-bridge-otel` in the service, sending to Jaeger or Grafana Tempo |
-| Central log search | Grafana Loki or OpenSearch with a log shipper (Fluent Bit) |
-| Alerts | Prometheus Alertmanager: pod restarts, certificate expiry < 14 days, 5xx rate, WAF block spikes |
+| Prometheus | scrapes Kong (status port 8100), ticket-service (management port 9090), kube-state-metrics, cert-manager; keeps history; evaluates alert rules |
+| Alertmanager | groups and routes alerts (locally: shown in its UI; production: pager / chat) |
+| Loki | stores every pod's log and the Kubernetes audit log; its rules are the local SIEM |
+| Tempo | stores traces sent by Kong and ticket-service (OpenTelemetry) |
+| Alloy | ships pod logs and the audit log to Loki |
+| Grafana | dashboards (*Ticketing overview*), log search, traces |
 
-When adding these, remember the Zero Trust rules (guide 8): every new component needs its own
-NetworkPolicy allowing exactly the connections it makes. Also note that ticket-service accepts only
-mTLS connections from Kong, so a metrics scraper would need a separate management port or its own
-allowed certificate.
+Every component has CPU and memory limits and its own NetworkPolicies (`k8s/91-observability-network-policies.yaml`).
+ticket-service exposes metrics and health on a separate plain-HTTP management port (9090), so the mTLS
+API port stays Kong-only.
+
+**Open the tools** (each command keeps running; use a separate terminal):
+
+```bash
+kubectl -n observability port-forward svc/grafana 3000:3000         # http://localhost:3000
+kubectl -n observability port-forward svc/prometheus 9090:9090      # http://localhost:9090/alerts
+kubectl -n observability port-forward svc/alertmanager 9093:9093    # http://localhost:9093
+kubectl -n observability get secret grafana-admin -o jsonpath="{.data.password}" | base64 -d; echo   # Grafana password (user admin)
+```
+
+**Find a request's trace:** take the `X-Correlation-ID` from a response, search the service log for
+`cid=<id>` in Grafana *Explore* (Loki), then open the trace in Tempo; the service log line carries the
+trace ID.
+
+**Alerts that exist** (see `k8s/90-observability.yaml`):
+
+| Group | Alerts |
+|---|---|
+| Service level | `ApiErrorBudgetFastBurn` (page), `ApiErrorBudgetSlowBurn`, `ApiLatencySloBreach` |
+| Data | `OutboxBacklogGrowing`, `OutboxEventsDead`, `OutboxPublishFailures`, `BackupTooOld`, `BackupFailing`, `PostgresWalArchivingFailing` |
+| Tenants | `TenantThrottled` |
+| Platform | `CertificateExpiresSoon`, `CertificateNotReady`, `PodRestarting`, `PodNotReady`, `ScrapeTargetDown`, `Watchdog` (always firing: if it stops, alerting itself is broken) |
+| Security (Loki) | `KeycloakMasterRealmLoginFailures`, `TicketingRealmCredentialStuffing`, `KeycloakPrivilegeChange`, `UntrustedWorkloadIdentity`, `WafBlockSpike`, `KubernetesSecretsReadByHuman`, `KubernetesExecOrPortForward`, `AuditLogSilent` |
+
+**Check the whole stack in one go:** `bash scripts/verify-observability.sh` (15 checks, including a
+simulated brute-force attack on the admin realm that must raise an alert).
+
+When adding components, remember the Zero Trust rules (guide 8): every new component needs its own
+NetworkPolicy allowing exactly the connections it makes.

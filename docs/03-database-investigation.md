@@ -13,8 +13,8 @@ The same ticket **id** (a UUID such as `4c11dc58-be9b-4feb-9526-0aea18ead481`) i
 
 > **Golden rules**
 > 1. **Look, don't touch.** Only run `SELECT` (PostgreSQL) and `find`/`aggregate`/`count` (MongoDB)
->    unless a change has been agreed. A wrong `UPDATE`/`DELETE` cannot be undone (there are no backups
->    in this installation).
+>    unless a change has been agreed. A wrong `UPDATE`/`DELETE` can only be undone by a point-in-time
+>    restore (section 3.6), which is slow and affects every tenant.
 > 2. Ticket data contains **personal data** (emails, mobile numbers). Do not copy it into chats,
 >    tickets or e-mails.
 > 3. The databases are reachable **only** from inside the cluster (NetworkPolicy). The commands below
@@ -147,8 +147,19 @@ db.ticket_details.getIndexes()
 
 ## 3.4 Checking that both databases agree
 
-There is no single transaction across two databases, so after an incident (for example MongoDB was
-down for a moment) it is worth checking that each ticket exists in both.
+There is no single transaction across two databases. Every change is first recorded in the
+`ticket_outbox` table in PostgreSQL (same transaction as the change) and then copied to MongoDB; if
+MongoDB was down, the copy is retried every 5 seconds until it succeeds. So after an incident, first
+check the outbox, then compare counts.
+
+```bash
+# events not yet copied to MongoDB (should be 0, or a few for a few seconds)
+kubectl -n ticketing exec postgres-0 -c postgres -- psql -U postgres -d ticketing -c \
+  "SELECT count(*) AS pending, max(attempts) AS max_attempts, min(occurred_at) AS oldest FROM ticket_outbox WHERE published_at IS NULL;"
+```
+
+Rows with many attempts and a `last_error` are "dead" events: they raise the `OutboxEventsDead` alert
+and need investigation (the error text says why).
 
 ```bash
 # counts per tenant in PostgreSQL
@@ -164,9 +175,10 @@ The two lists should be identical. What a mismatch means:
 
 | Symptom | Meaning | Effect for users |
 |---|---|---|
-| A ticket in PostgreSQL but not in MongoDB | details lost | the ticket shows "(details unavailable)" |
-| A ticket in MongoDB but not in PostgreSQL | creation failed half-way and the clean-up failed too | invisible to users; harmless orphan |
-| History missing the latest step | the status changed but the history entry could not be written | the API log has a WARN "could not be written to MongoDB" |
+| A ticket in PostgreSQL but not in MongoDB, with a pending outbox row | the copy has not happened yet (MongoDB down or slow) | details appear once the relay succeeds |
+| A ticket in PostgreSQL but not in MongoDB, no pending outbox row | the MongoDB document was lost after it was written (e.g. restored from an older backup) | the ticket shows "(details unavailable)"; with agreement, set `published_at = NULL` on that ticket's outbox rows and the relay rebuilds it (copying is idempotent; rows are kept 30 days) |
+| A ticket in MongoDB but not in PostgreSQL | should not happen any more (MongoDB is written only from the outbox) | investigate; harmless to users |
+| History missing the latest step | the copy is still pending | the outbox row is pending; `OutboxBacklogGrowing` fires if it lasts |
 
 ## 3.5 Using a graphical tool (optional)
 
@@ -191,3 +203,38 @@ For MongoDB Compass use the connection string
 
 > A port-forward bypasses the network rules for as long as it runs. Only open one when you need it,
 > close it afterwards, and never leave it running on a shared machine.
+
+## 3.6 Backups and point-in-time restore
+
+Each database runs as **one instance** (a deliberate choice to save laptop resources). Instead of
+replicas, a `backup` sidecar next to each database keeps **one backup copy** on its own volume:
+
+| Database | What is kept | How often | Worst-case data loss (RPO) |
+|---|---|---|---|
+| PostgreSQL | one base backup (`pg_basebackup`) + every WAL file since it (compressed) | base daily; WAL at least every 5 min | 5 minutes |
+| MongoDB (1-member replica set) | one full dump with its oplog + oplog slices since it | full daily; slice every 5 min | 5 minutes |
+
+**Is the backup healthy?** Each sidecar writes a status line every 5 minutes, and the `BackupTooOld`,
+`BackupFailing` and `PostgresWalArchivingFailing` alerts watch them:
+
+```bash
+kubectl -n ticketing logs postgres-0 -c backup --tail=3   # backup status: db=postgres base_age_seconds=... wal_files=...
+kubectl -n ticketing logs mongo-0 -c backup --tail=3      # backup status: db=mongo base_age_seconds=... oplog_slices=...
+```
+
+**Prove it can be restored (restore drill).** The drill restores the backup into a throw-away pod with no
+network access, rolls it forward to the chosen time, compares it with the live database and deletes the
+pod. The live databases are never touched.
+
+```bash
+bash scripts/restore-drill.sh all                               # restore to "now"
+bash scripts/restore-drill.sh postgres "2026-10-05 08:15:00"    # restore to a UTC time
+```
+
+Run it after every change to the backup set-up and at least monthly. A real restore (replacing the live
+data) uses the same steps but must be agreed first: it rewinds **every tenant** to that time.
+
+**Limits on the laptop:** the backup copy sits on the same node as the database, so losing the node or
+the Docker volume loses both. In production the copy goes to object storage in another account with
+object lock, and the databases are managed services with standby replicas (guide 7 and
+[enterprise-gap.md](enterprise-gap.md)).

@@ -1,0 +1,682 @@
+# Observability + local SIEM (namespace `observability`, internal only: reach Grafana with
+# `kubectl -n observability port-forward svc/grafana 3000:3000`).
+#
+#   metrics  Prometheus (ticket-service /actuator/prometheus, Kong /metrics, cert-manager, kube-state-metrics)
+#   traces   Tempo (OTLP from Kong and ticket-service, W3C traceparent)
+#   logs     Loki, fed by Alloy (every pod log + the Kubernetes API audit log) = local SIEM
+#   alerts   Prometheus rules (SLO burn rates, outbox, quotas, certificates, pods) and Loki rules
+#            (security detections) -> Alertmanager
+#
+# LOCAL: one replica each, short retention, small memory AND CPU limits (laptop-friendly). PRODUCTION: managed equivalents
+# (Amazon Managed Prometheus/Grafana, CloudWatch/OpenSearch or a SIEM, X-Ray/ADOT), long retention,
+# Alertmanager routes to PagerDuty/Slack (docs/02, docs/07).
+# ---------------------------------------------------------------- Prometheus
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: observability
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+      external_labels: {cluster: ticketing-local}
+    alerting:
+      alertmanagers:
+        - static_configs: [{targets: ["alertmanager.observability.svc.cluster.local:9093"]}]
+    rule_files: ["/etc/prometheus/rules/*.yml"]
+    # Static targets: no Kubernetes API access (and no service-account token) needed for discovery.
+    scrape_configs:
+      - job_name: ticket-service
+        metrics_path: /actuator/prometheus
+        static_configs: [{targets: ["ticket-service.ticketing.svc.cluster.local:9090"]}]
+      - job_name: kong
+        static_configs: [{targets: ["kong.gateway.svc.cluster.local:8100"]}]
+      - job_name: cert-manager
+        static_configs: [{targets: ["cert-manager.cert-manager.svc.cluster.local:9402"]}]
+      - job_name: kube-state-metrics
+        static_configs: [{targets: ["kube-state-metrics.observability.svc.cluster.local:8080"]}]
+      - job_name: observability
+        static_configs:
+          - targets: ["localhost:9090", "alertmanager.observability.svc.cluster.local:9093",
+                      "loki.observability.svc.cluster.local:3100", "tempo.observability.svc.cluster.local:3200"]
+  slo-and-platform.yml: |
+    groups:
+      # ---------------- SLO: API availability (target 99.5 % non-5xx at the gateway, 28-day window)
+      - name: slo-api-availability
+        rules:
+          - record: slo:api_error_ratio:rate5m
+            expr: sum(rate(kong_http_requests_total{service="ticket-service",code=~"5.."}[5m])) / clamp_min(sum(rate(kong_http_requests_total{service="ticket-service"}[5m])), 1e-9)
+          - record: slo:api_error_ratio:rate30m
+            expr: sum(rate(kong_http_requests_total{service="ticket-service",code=~"5.."}[30m])) / clamp_min(sum(rate(kong_http_requests_total{service="ticket-service"}[30m])), 1e-9)
+          - record: slo:api_error_ratio:rate1h
+            expr: sum(rate(kong_http_requests_total{service="ticket-service",code=~"5.."}[1h])) / clamp_min(sum(rate(kong_http_requests_total{service="ticket-service"}[1h])), 1e-9)
+          - record: slo:api_error_ratio:rate6h
+            expr: sum(rate(kong_http_requests_total{service="ticket-service",code=~"5.."}[6h])) / clamp_min(sum(rate(kong_http_requests_total{service="ticket-service"}[6h])), 1e-9)
+          # multi-window, multi-burn-rate (error budget 0.5 %): fast burn pages, slow burn tickets
+          - alert: ApiErrorBudgetFastBurn
+            expr: slo:api_error_ratio:rate1h > (14.4 * 0.005) and slo:api_error_ratio:rate5m > (14.4 * 0.005)
+            for: 2m
+            labels: {severity: page}
+            annotations:
+              summary: API is burning its error budget 14x too fast (2 % of the monthly budget per hour)
+              runbook: docs/02-observability.md and interview/13-Observability.md
+          - alert: ApiErrorBudgetSlowBurn
+            expr: slo:api_error_ratio:rate6h > (6 * 0.005) and slo:api_error_ratio:rate30m > (6 * 0.005)
+            for: 15m
+            labels: {severity: ticket}
+            annotations: {summary: API error budget is burning 6x too fast}
+      # ---------------- SLO: latency (99 % of API requests under 1 s, measured at the service)
+      - name: slo-api-latency
+        rules:
+          - record: slo:api_latency_good_ratio:rate30m
+            expr: sum(rate(http_server_requests_seconds_bucket{application="ticket-service",uri=~"/api.*",le="1.0"}[30m])) / clamp_min(sum(rate(http_server_requests_seconds_count{application="ticket-service",uri=~"/api.*"}[30m])), 1e-9)
+          - alert: ApiLatencySloBreach
+            expr: slo:api_latency_good_ratio:rate30m < 0.99 and sum(rate(http_server_requests_seconds_count{application="ticket-service"}[30m])) > 0
+            for: 15m
+            labels: {severity: ticket}
+            annotations: {summary: Less than 99 % of API requests completed within 1 s over 30 minutes}
+      # ---------------- Data integrity: the outbox must drain (history is never lost, but it must arrive)
+      - name: data-integrity
+        rules:
+          - alert: OutboxBacklogGrowing
+            expr: ticketing_outbox_oldest_pending_age_seconds > 300
+            for: 5m
+            labels: {severity: ticket}
+            annotations: {summary: "History events have been waiting > 5 min to reach MongoDB (is MongoDB up?)"}
+          - alert: OutboxEventsDead
+            expr: ticketing_outbox_dead > 0
+            labels: {severity: page}
+            annotations: {summary: "Outbox events exhausted their retries - manual action needed (ticket_outbox.last_error)"}
+          - alert: OutboxPublishFailures
+            expr: increase(ticketing_outbox_publish_failures_total[10m]) > 0
+            labels: {severity: ticket}
+            annotations: {summary: Projection of history to MongoDB is failing (retrying)}
+      # ---------------- Tenancy: noisy neighbours
+      - name: tenancy
+        rules:
+          - alert: TenantThrottled
+            expr: sum by (tenant) (increase(ticketing_tenant_throttled_total[10m])) > 20
+            labels: {severity: ticket}
+            annotations: {summary: "Tenant {{ $labels.tenant }} is hitting its quota (noisy neighbour or capacity need)"}
+      # ---------------- Platform
+      - name: platform
+        rules:
+          - alert: CertificateExpiresSoon
+            expr: (certmanager_certificate_expiration_timestamp_seconds - time()) < 14 * 86400
+            labels: {severity: ticket}
+            annotations: {summary: "Certificate {{ $labels.namespace }}/{{ $labels.name }} expires in < 14 days - run scripts/reload-certs.sh after renewal"}
+          - alert: CertificateNotReady
+            expr: certmanager_certificate_ready_status{condition="True"} == 0
+            for: 10m
+            labels: {severity: page}
+            annotations: {summary: "Certificate {{ $labels.namespace }}/{{ $labels.name }} is not ready"}
+          - alert: PodRestarting
+            expr: increase(kube_pod_container_status_restarts_total[15m]) > 2
+            labels: {severity: ticket}
+            annotations: {summary: "{{ $labels.namespace }}/{{ $labels.pod }} ({{ $labels.container }}) restarted repeatedly"}
+          - alert: PodNotReady
+            expr: kube_pod_status_ready{condition="true", namespace=~"edge|gateway|auth|ticketing"} == 0
+            for: 10m
+            labels: {severity: page}
+            annotations: {summary: "{{ $labels.namespace }}/{{ $labels.pod }} not ready for 10 minutes"}
+          - alert: ScrapeTargetDown
+            expr: up == 0
+            for: 5m
+            labels: {severity: ticket}
+            annotations: {summary: "Metrics target {{ $labels.job }} ({{ $labels.instance }}) is down"}
+          # Dead man's switch: always firing. If it stops arriving at the receiver, the alerting pipeline is broken.
+          - alert: Watchdog
+            expr: vector(1)
+            labels: {severity: none}
+            annotations: {summary: Alerting pipeline heartbeat (always firing by design)}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  selector: {app: prometheus}
+  ports: [{name: http, port: 9090, targetPort: 9090}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: observability
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: prometheus}}
+  template:
+    metadata:
+      labels: {app: prometheus}
+      annotations: {ticketing/config-version: "1"}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, fsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.15.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            - --storage.tsdb.retention.time=3d
+            - --storage.tsdb.retention.size=1GB
+            - --web.enable-lifecycle
+          ports: [{name: http, containerPort: 9090}]
+          readinessProbe: {httpGet: {path: /-/ready, port: http}, periodSeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/prometheus/prometheus.yml, subPath: prometheus.yml}
+            - {name: config, mountPath: /etc/prometheus/rules/slo-and-platform.yml, subPath: slo-and-platform.yml}
+            - {name: data, mountPath: /prometheus}
+      volumes:
+        - {name: config, configMap: {name: prometheus-config}}
+        - {name: data, emptyDir: {sizeLimit: 2Gi}}
+---
+# ---------------------------------------------------------------- Alertmanager
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: observability
+data:
+  alertmanager.yml: |
+    # LOCAL: alerts are visible in Alertmanager (API/UI) and Grafana. PRODUCTION: route `page` to
+    # PagerDuty/Opsgenie, `ticket` to the team channel, Watchdog to an external dead-man's-switch service.
+    route:
+      receiver: local
+      group_by: [alertname, namespace]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+      routes:
+        - matchers: ['alertname="Watchdog"']
+          receiver: heartbeat
+          repeat_interval: 1m
+    receivers:
+      - name: local
+      - name: heartbeat
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: observability
+spec:
+  selector: {app: alertmanager}
+  ports: [{name: http, port: 9093, targetPort: 9093}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: alertmanager
+  namespace: observability
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: alertmanager}}
+  template:
+    metadata:
+      labels: {app: alertmanager}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, runAsGroup: 65534, fsGroup: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: alertmanager
+          image: prom/alertmanager:v0.34.1
+          args: [--config.file=/etc/alertmanager/alertmanager.yml, --storage.path=/alertmanager, --cluster.listen-address=]
+          ports: [{name: http, containerPort: 9093}]
+          readinessProbe: {httpGet: {path: /-/ready, port: http}, periodSeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 10m, memory: 24Mi}, limits: {cpu: 100m, memory: 64Mi}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alertmanager}
+            - {name: data, mountPath: /alertmanager}
+      volumes:
+        - {name: config, configMap: {name: alertmanager-config}}
+        - {name: data, emptyDir: {}}
+---
+# ---------------------------------------------------------------- Loki (logs = local SIEM) + security rules
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-config
+  namespace: observability
+data:
+  loki.yaml: |
+    auth_enabled: false
+    server: {http_listen_port: 3100, log_level: warn}
+    common:
+      path_prefix: /loki
+      replication_factor: 1
+      ring: {kvstore: {store: inmemory}}
+      storage: {filesystem: {chunks_directory: /loki/chunks, rules_directory: /loki/rules}}
+    schema_config:
+      configs:
+        - {from: "2024-01-01", store: tsdb, object_store: filesystem, schema: v13, index: {prefix: index_, period: 24h}}
+    limits_config:
+      retention_period: 168h          # 7 days locally; production SIEM retention per policy (e.g. 1 year)
+      ingestion_rate_mb: 8
+      ingestion_burst_size_mb: 16
+    compactor: {working_directory: /loki/compactor, retention_enabled: true, delete_request_store: filesystem}
+    ruler:
+      storage: {type: local, local: {directory: /etc/loki/rules}}
+      rule_path: /loki/rules-temp
+      alertmanager_url: http://alertmanager.observability.svc.cluster.local:9093
+      enable_api: true
+      evaluation_interval: 1m
+      ring: {kvstore: {store: inmemory}}
+    analytics: {reporting_enabled: false}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: loki-rules
+  namespace: observability
+data:
+  security-detections.yaml: |
+    groups:
+      - name: security-detections
+        interval: 1m
+        rules:
+          # Compensating control for the ACCEPTED GAP "Keycloak admin console reachable through the WAF"
+          - alert: KeycloakMasterRealmLoginFailures
+            expr: sum(count_over_time({namespace="auth", container="keycloak"} |= "LOGIN_ERROR" |~ "realm(Name|Id)=\"?master" [5m])) > 5
+            labels: {severity: page}
+            annotations: {summary: "More than 5 failed logins to the Keycloak MASTER (admin) realm in 5 minutes"}
+          - alert: TicketingRealmCredentialStuffing
+            expr: sum(count_over_time({namespace="auth", container="keycloak"} |= "LOGIN_ERROR" |~ "realm(Name|Id)=\"?ticketing" [5m])) > 20
+            labels: {severity: page}
+            annotations: {summary: "Burst of failed logins in the ticketing realm (credential stuffing?)"}
+          - alert: KeycloakPrivilegeChange
+            expr: sum(count_over_time({namespace="auth", container="keycloak"} |~ "operationType=\"?(CREATE|DELETE)" |~ "GROUP_MEMBERSHIP" [5m])) > 0
+            labels: {severity: ticket}
+            annotations: {summary: "A user's group (role) membership changed in Keycloak - verify it was an approved change"}
+          - alert: UntrustedWorkloadIdentity
+            expr: sum(count_over_time({namespace="ticketing", container="ticket-service"} |= "untrusted workload identity" [5m])) > 0
+            labels: {severity: page}
+            annotations: {summary: "ticket-service rejected a caller whose mTLS identity is not kong-gateway (lateral movement?)"}
+          - alert: WafBlockSpike
+            expr: sum(count_over_time({namespace="edge", container="waf"} |= "\"transaction\"" |= "\"http_code\":403" [5m])) > 50
+            labels: {severity: ticket}
+            annotations: {summary: "WAF blocked more than 50 requests in 5 minutes (attack campaign or false positives after a release)"}
+          - alert: KubernetesSecretsReadByHuman
+            expr: sum(count_over_time({job="kubernetes-audit"} | json | objectRef_resource="secrets" | verb=~"get|list|watch" | user_username!~"system:.*" [5m])) > 0
+            labels: {severity: ticket}
+            annotations: {summary: "Kubernetes secrets were read by a non-system identity (audit log)"}
+          - alert: KubernetesExecOrPortForward
+            expr: sum(count_over_time({job="kubernetes-audit"} | json | objectRef_subresource=~"exec|portforward|attach" | user_username!~"system:.*" [5m])) > 0
+            labels: {severity: ticket}
+            annotations: {summary: "Someone used kubectl exec/port-forward/attach (audit log) - expected only during approved operations"}
+      - name: data-protection
+        interval: 1m
+        rules:
+          - alert: BackupTooOld
+            expr: max by (db) (max_over_time({container="backup"} |= "backup status" | regexp "db=(?P<db>[a-z]+) base_age_seconds=(?P<age>[0-9]+)" | unwrap age [15m])) > 93600
+            labels: {severity: page}
+            annotations: {summary: "The {{ $labels.db }} base backup is older than 26 hours"}
+          - alert: BackupFailing
+            expr: sum by (pod) (count_over_time({container="backup"} |~ "BACKUP FAILED|DUMP FAILED|SLICE FAILED" [30m])) > 0
+            labels: {severity: page}
+            annotations: {summary: "Backup agent in {{ $labels.pod }} reports failures"}
+          - alert: PostgresWalArchivingFailing
+            expr: sum(count_over_time({namespace="ticketing", container="postgres"} |= "archive command failed" [10m])) > 0
+            labels: {severity: page}
+            annotations: {summary: "PostgreSQL cannot archive WAL - point-in-time recovery is degrading"}
+          - alert: AuditLogSilent
+            expr: sum(count_over_time({job="kubernetes-audit"}[15m])) == 0
+            labels: {severity: ticket}
+            annotations: {summary: "No Kubernetes audit events received for 15 minutes (log pipeline broken?)"}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: loki-data
+  namespace: observability
+spec:
+  accessModes: [ReadWriteOnce]
+  resources: {requests: {storage: 2Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  selector: {app: loki}
+  ports: [{name: http, port: 3100, targetPort: 3100}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki
+  namespace: observability
+spec:
+  replicas: 1
+  strategy: {type: Recreate}         # RWO volume
+  selector: {matchLabels: {app: loki}}
+  template:
+    metadata:
+      labels: {app: loki}
+      annotations: {ticketing/config-version: "1"}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: loki
+          image: grafana/loki:3.7.8
+          args: [-config.file=/etc/loki/config/loki.yaml]
+          ports: [{name: http, containerPort: 3100}]
+          readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 10, initialDelaySeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 50m, memory: 128Mi}, limits: {cpu: 500m, memory: 512Mi}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/loki/config}
+            - {name: rules, mountPath: /etc/loki/rules/fake}
+            - {name: data, mountPath: /loki}
+      volumes:
+        - {name: config, configMap: {name: loki-config}}
+        - {name: rules, configMap: {name: loki-rules}}
+        - {name: data, persistentVolumeClaim: {claimName: loki-data}}
+---
+# ---------------------------------------------------------------- Tempo (traces)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: tempo-config
+  namespace: observability
+data:
+  tempo.yaml: |
+    stream_over_http_enabled: true
+    server: {http_listen_port: 3200, log_level: warn}
+    distributor:
+      receivers:
+        otlp:
+          protocols:
+            http: {endpoint: "0.0.0.0:4318"}
+    ingester: {max_block_duration: 5m}
+    compactor: {compaction: {block_retention: 24h}}
+    storage:
+      trace:
+        backend: local
+        local: {path: /var/tempo/traces}
+        wal: {path: /var/tempo/wal}
+    usage_report: {reporting_enabled: false}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tempo
+  namespace: observability
+spec:
+  selector: {app: tempo}
+  ports:
+    - {name: http, port: 3200, targetPort: 3200}
+    - {name: otlp-http, port: 4318, targetPort: 4318}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tempo
+  namespace: observability
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: tempo}}
+  template:
+    metadata:
+      labels: {app: tempo}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, fsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: tempo
+          image: grafana/tempo:2.10.8
+          args: [-config.file=/etc/tempo/tempo.yaml]
+          ports:
+            - {name: http, containerPort: 3200}
+            - {name: otlp-http, containerPort: 4318}
+          readinessProbe: {httpGet: {path: /ready, port: http}, periodSeconds: 10, initialDelaySeconds: 15}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 20m, memory: 96Mi}, limits: {cpu: 300m, memory: 384Mi}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/tempo}
+            - {name: data, mountPath: /var/tempo}
+      volumes:
+        - {name: config, configMap: {name: tempo-config}}
+        - {name: data, emptyDir: {sizeLimit: 1Gi}}
+---
+# ---------------------------------------------------------------- kube-state-metrics (pod/deployment state)
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics
+rules:
+  # read-only, and only the object kinds it reports on (no secrets, no configmaps)
+  - apiGroups: [""]
+    resources: [pods, persistentvolumeclaims]
+    verbs: [list, watch]
+  - apiGroups: [apps]
+    resources: [deployments, statefulsets, daemonsets]
+    verbs: [list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-state-metrics
+roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: kube-state-metrics}
+subjects: [{kind: ServiceAccount, name: kube-state-metrics, namespace: observability}]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+spec:
+  selector: {app: kube-state-metrics}
+  ports: [{name: http, port: 8080, targetPort: 8080}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: observability
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: kube-state-metrics}}
+  template:
+    metadata:
+      labels: {app: kube-state-metrics}
+    spec:
+      serviceAccountName: kube-state-metrics
+      automountServiceAccountToken: true     # the one component here that needs the Kubernetes API (read-only)
+      securityContext: {runAsNonRoot: true, runAsUser: 65534, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: kube-state-metrics
+          image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0
+          args: ["--resources=pods,deployments,statefulsets,daemonsets,persistentvolumeclaims", "--port=8080", "--telemetry-port=8081"]
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe: {httpGet: {path: /readyz, port: 8081}, periodSeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 10m, memory: 24Mi}, limits: {cpu: 100m, memory: 96Mi}}
+---
+# ---------------------------------------------------------------- Alloy: ships pod logs + Kubernetes audit log to Loki
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alloy-config
+  namespace: observability
+data:
+  config.alloy: |
+    // Pod logs: labels derived from the file path, so no Kubernetes API access is needed.
+    local.file_match "pods" {
+      path_targets = [{"__path__" = "/var/log/pods/*/*/*.log", "job" = "pods"}]
+    }
+    discovery.relabel "pods" {
+      targets = local.file_match.pods.targets
+      rule {
+        source_labels = ["__path__"]
+        regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/.*"
+        target_label  = "namespace"
+        replacement   = "$1"
+      }
+      rule {
+        source_labels = ["__path__"]
+        regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/.*"
+        target_label  = "pod"
+        replacement   = "$2"
+      }
+      rule {
+        source_labels = ["__path__"]
+        regex         = "/var/log/pods/([^_]+)_([^_]+)_[^/]+/([^/]+)/.*"
+        target_label  = "container"
+        replacement   = "$3"
+      }
+    }
+    loki.source.file "pods" {
+      targets    = discovery.relabel.pods.output
+      forward_to = [loki.process.pods.receiver]
+    }
+    loki.process "pods" {
+      stage.cri {}
+      forward_to = [loki.write.local.receiver]
+    }
+    // Kubernetes API audit log (written by the API server on the node; see scripts/enable-k8s-audit.sh)
+    local.file_match "audit" {
+      path_targets = [{"__path__" = "/var/log/kubernetes/audit/audit.log", "job" = "kubernetes-audit"}]
+    }
+    loki.source.file "audit" {
+      targets    = local.file_match.audit.targets
+      forward_to = [loki.write.local.receiver]
+    }
+    loki.write "local" {
+      endpoint {
+        url = "http://loki.observability.svc.cluster.local:3100/loki/api/v1/push"
+      }
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: alloy
+  namespace: observability
+spec:
+  selector: {matchLabels: {app: alloy}}
+  template:
+    metadata:
+      labels: {app: alloy}
+      annotations: {ticketing/config-version: "1"}
+    spec:
+      automountServiceAccountToken: false
+      # Reading node log files (root-owned, 0640) requires root; mounts are read-only and all capabilities
+      # except DAC_READ_SEARCH (read any file) are dropped. Documented exception (docs/08).
+      securityContext: {runAsUser: 0, runAsGroup: 0, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: alloy
+          image: grafana/alloy:v1.20.1
+          args: [run, /etc/alloy/config.alloy, --storage.path=/var/lib/alloy, --server.http.listen-addr=0.0.0.0:12345, --disable-reporting]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL], add: [DAC_READ_SEARCH]}
+          resources: {requests: {cpu: 20m, memory: 48Mi}, limits: {cpu: 200m, memory: 192Mi}}
+          volumeMounts:
+            - {name: config, mountPath: /etc/alloy}
+            - {name: state, mountPath: /var/lib/alloy}
+            - {name: pod-logs, mountPath: /var/log/pods, readOnly: true}
+            - {name: audit-logs, mountPath: /var/log/kubernetes/audit, readOnly: true}
+      volumes:
+        - {name: config, configMap: {name: alloy-config}}
+        - {name: state, emptyDir: {}}
+        - {name: pod-logs, hostPath: {path: /var/log/pods}}
+        - {name: audit-logs, hostPath: {path: /var/log/kubernetes/audit, type: DirectoryOrCreate}}
+---
+# ---------------------------------------------------------------- Grafana (internal only)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-provisioning
+  namespace: observability
+data:
+  datasources.yaml: |
+    apiVersion: 1
+    datasources:
+      - {name: Prometheus, uid: prometheus, type: prometheus, url: "http://prometheus.observability.svc.cluster.local:9090", isDefault: true}
+      - name: Loki
+        uid: loki
+        type: loki
+        url: http://loki.observability.svc.cluster.local:3100
+        jsonData:
+          derivedFields:
+            - {name: TraceID, matcherRegex: "\\[ticket-service,([0-9a-f]{32}),", datasourceUid: tempo, url: "$${__value.raw}"}
+      - name: Tempo
+        uid: tempo
+        type: tempo
+        url: http://tempo.observability.svc.cluster.local:3200
+        jsonData:
+          tracesToLogsV2: {datasourceUid: loki, filterByTraceID: true}
+      - {name: Alertmanager, uid: alertmanager, type: alertmanager, url: "http://alertmanager.observability.svc.cluster.local:9093", jsonData: {implementation: prometheus}}
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - {name: ticketing, folder: Ticketing, type: file, options: {path: /var/lib/grafana/dashboards}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  selector: {app: grafana}
+  ports: [{name: http, port: 3000, targetPort: 3000}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: observability
+spec:
+  replicas: 1
+  selector: {matchLabels: {app: grafana}}
+  template:
+    metadata:
+      labels: {app: grafana}
+      annotations: {ticketing/config-version: "1"}
+    spec:
+      automountServiceAccountToken: false
+      securityContext: {runAsNonRoot: true, runAsUser: 472, runAsGroup: 472, fsGroup: 472, seccompProfile: {type: RuntimeDefault}}
+      containers:
+        - name: grafana
+          image: grafana/grafana:11.6.16          # 11.x LTS line: far lighter start-up than 12/13 on a laptop
+          env:
+            - {name: GF_SECURITY_ADMIN_USER, value: admin}
+            - name: GF_SECURITY_ADMIN_PASSWORD
+              valueFrom: {secretKeyRef: {name: grafana-admin, key: password}}
+            - {name: GF_AUTH_ANONYMOUS_ENABLED, value: "false"}
+            - {name: GF_ANALYTICS_REPORTING_ENABLED, value: "false"}
+            - {name: GF_ANALYTICS_CHECK_FOR_UPDATES, value: "false"}
+            - {name: GF_PATHS_PROVISIONING, value: /etc/grafana/provisioning}
+            - {name: GF_USERS_ALLOW_SIGN_UP, value: "false"}
+          ports: [{name: http, containerPort: 3000}]
+          readinessProbe: {httpGet: {path: /api/health, port: http}, periodSeconds: 10, initialDelaySeconds: 10}
+          securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+          resources: {requests: {cpu: 20m, memory: 96Mi}, limits: {cpu: 500m, memory: 256Mi}}
+          volumeMounts:
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/datasources/datasources.yaml, subPath: datasources.yaml}
+            - {name: provisioning, mountPath: /etc/grafana/provisioning/dashboards/dashboards.yaml, subPath: dashboards.yaml}
+            - {name: dashboards, mountPath: /var/lib/grafana/dashboards}
+            - {name: data, mountPath: /var/lib/grafana}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - {name: provisioning, configMap: {name: grafana-provisioning}}
+        - {name: dashboards, configMap: {name: grafana-dashboards}}
+        - {name: data, emptyDir: {}}
+        - {name: tmp, emptyDir: {}}

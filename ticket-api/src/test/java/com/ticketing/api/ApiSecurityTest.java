@@ -2,6 +2,8 @@ package com.ticketing.api;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
@@ -12,6 +14,9 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.ticketing.core.TenantPolicy;
+import com.ticketing.core.TenantPolicyService;
+import com.ticketing.core.TenantUsageMeter;
 import com.ticketing.core.TicketForbiddenException;
 import com.ticketing.core.TicketService;
 import com.ticketing.core.TicketStatus;
@@ -22,6 +27,7 @@ import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.WebMvcTest;
@@ -48,6 +54,16 @@ class ApiSecurityTest {
     TicketService service;
     @MockitoBean
     JwtDecoder jwtDecoder;
+    @MockitoBean
+    TenantPolicyService tenantPolicies;
+    @MockitoBean
+    TenantUsageMeter tenantUsage;
+
+    @BeforeEach
+    void generousQuotas() {
+        when(tenantPolicies.policyFor(anyString()))
+                .thenAnswer(inv -> new TenantPolicy(inv.getArgument(0), "standard", 1000, 20));
+    }
 
     private static JwtRequestPostProcessor user(String email, String... groups) {
         return jwt().jwt(j -> j.claim("email", email).claim("groups", List.of(groups)));
@@ -146,6 +162,26 @@ class ApiSecurityTest {
         mvc.perform(get("/api/tickets").param("page", "-1").with(user("alice@acme.test", "/acme/applicant")))
                 .andExpect(status().isBadRequest());
         verifyNoInteractions(service);
+    }
+
+    @Test
+    void tenantQuotaIsEnforcedAcrossUsersOfTheSameTenant() throws Exception {
+        // tenant "tiny" allows 2 requests per minute in total, regardless of which user sends them
+        when(tenantPolicies.policyFor("tiny")).thenReturn(new TenantPolicy("tiny", "standard", 2, 20));
+        when(service.myTickets(0, 50)).thenReturn(List.of());
+
+        mvc.perform(get("/api/tickets").with(user("a@tiny.test", "/tiny/applicant")))
+                .andExpect(status().isOk())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header()
+                        .string("X-Tenant-RateLimit-Remaining", "1"));
+        mvc.perform(get("/api/tickets").with(user("b@tiny.test", "/tiny/applicant"))).andExpect(status().isOk());
+        mvc.perform(get("/api/tickets").with(user("c@tiny.test", "/tiny/applicant")))
+                .andExpect(status().isTooManyRequests())
+                .andExpect(org.springframework.test.web.servlet.result.MockMvcResultMatchers.header().exists("Retry-After"));
+
+        verify(tenantUsage, atLeastOnce()).recordThrottled("tiny");
+        // another tenant is unaffected (noisy-neighbour isolation)
+        mvc.perform(get("/api/tickets").with(user("x@acme.test", "/acme/applicant"))).andExpect(status().isOk());
     }
 
     @Test

@@ -1,11 +1,13 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# Applied after cert-manager is installed (scripts/up.sh). The Kong declarative-config Secret is
+# Applied after cert-manager and External Secrets are installed (scripts/up.sh). The Kong declarative-config Secret is
 # produced by scripts/render-kong.sh because it embeds the Keycloak public key and Kong's client cert.
 resources:
   - 00-namespaces.yaml
   - 10-pki.yaml
+  - 15-secrets-manager.yaml
+  - 16-external-secrets.yaml
   - 20-postgres.yaml
   - 21-mongo.yaml
   - 30-keycloak.yaml
@@ -14,6 +16,8 @@ resources:
   - 60-kong.yaml
   - 70-network-policies.yaml
   - 80-waf.yaml
+  - 90-observability.yaml
+  - 91-observability-network-policies.yaml
 
 generatorOptions:
   disableNameSuffixHash: true
@@ -23,30 +27,12 @@ configMapGenerator:
     namespace: auth
     files:
       - realm-ticketing.json=keycloak/realm-ticketing.json
+  - name: grafana-dashboards
+    namespace: observability
+    files:
+      - ticketing-overview.json=grafana/ticketing-overview.json
 
-# DEMO CREDENTIALS ONLY. Replace (and stop committing them) for anything beyond a laptop demo.
-secretGenerator:
-  - name: postgres-credentials
-    namespace: ticketing
-    literals:
-      - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=pgAdminDemo1
-      - KEYCLOAK_DB_PASSWORD=kcDbDemo1
-      - TICKETING_DB_PASSWORD=ticketsDbDemo1
-  - name: mongo-credentials
-    namespace: ticketing
-    literals:
-      - MONGO_INITDB_ROOT_USERNAME=mongoadmin
-      - MONGO_INITDB_ROOT_PASSWORD=mongoAdminDemo1
-      - MONGO_APP_PASSWORD=mongoAppDemo1
-  - name: ticket-service-env
-    namespace: ticketing
-    literals:
-      - POSTGRES_PASSWORD=ticketsDbDemo1
-      - MONGODB_URI=mongodb://ticketing_app:mongoAppDemo1@mongo.ticketing.svc.cluster.local:27017/ticketing?authSource=ticketing
-  - name: keycloak-env
-    namespace: auth
-    literals:
-      - KC_DB_PASSWORD=kcDbDemo1
-      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
-      - KC_BOOTSTRAP_ADMIN_PASSWORD=adminDemo1
+# No credentials in Git. Every infrastructure secret is generated randomly and stored in OpenBao
+# (scripts/secrets-bootstrap.sh), then synced into Kubernetes Secrets by External Secrets
+# (16-external-secrets.yaml). The External Secrets Operator itself (k8s/vendor) is installed by up.sh
+# with server-side apply before this kustomization, because its CRDs are larger than client-side apply allows.

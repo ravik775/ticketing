@@ -210,6 +210,6 @@ Or simply run `bash scripts/up.sh` again: it is safe to repeat.
 
 ## 4.10 Known limits of this installation
 
-Single copies of everything, no backups, demo passwords in the repository, databases without TLS
+Single copies of everything (protected by point-in-time backups, one copy on the same node), databases without TLS
 inside the cluster, rate-limit counters kept per Kong copy, and a laptop-only hostname. Guide 7
 explains how each of these is solved on AWS; guide 8 lists the security trade-offs.

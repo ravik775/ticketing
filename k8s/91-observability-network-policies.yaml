@@ -1,0 +1,132 @@
+# Network policies for observability (default deny, explicit allows only), plus the narrow openings the
+# monitored workloads need: Prometheus may scrape their metrics ports, they may send traces to Tempo.
+#   prometheus -> ticket-service:9090 | kong:8100 | cert-manager:9402 | observability pods
+#   ticket-service, kong -> tempo:4318 (OTLP traces)
+#   alloy -> loki:3100 ; loki -> alertmanager:9093 ; grafana -> prometheus/loki/tempo/alertmanager
+#   kube-state-metrics -> Kubernetes API
+# Grafana is not exposed: reach it with kubectl port-forward (internal only).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: observability}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: observability}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+# The observability components talk to each other freely (same trust zone, no business data).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-within-namespace, namespace: observability}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from: [{podSelector: {}}]
+  egress:
+    - to: [{podSelector: {}}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: prometheus-scrape-egress, namespace: observability}
+spec:
+  podSelector: {matchLabels: {app: prometheus}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: ticket-service}}
+      ports: [{protocol: TCP, port: 9090}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+      ports: [{protocol: TCP, port: 8100}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: cert-manager}}
+      ports: [{protocol: TCP, port: 9402}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: tempo-otlp-ingress, namespace: observability}
+spec:
+  podSelector: {matchLabels: {app: tempo}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: ticket-service}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+      ports: [{protocol: TCP, port: 4318}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kube-state-metrics-api-egress, namespace: observability}
+spec:
+  podSelector: {matchLabels: {app: kube-state-metrics}}
+  policyTypes: [Egress]
+  egress:
+    - ports:                                   # Kubernetes API server (service 443 -> node 6443)
+        - {protocol: TCP, port: 443}
+        - {protocol: TCP, port: 6443}
+---
+# ---------------------------------------------------------------- openings in the monitored namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ticket-service-metrics-from-prometheus, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: ticket-service}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}
+          podSelector: {matchLabels: {app: prometheus}}
+      ports: [{protocol: TCP, port: 9090}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ticket-service-traces-egress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: ticket-service}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}
+          podSelector: {matchLabels: {app: tempo}}
+      ports: [{protocol: TCP, port: 4318}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kong-metrics-from-prometheus, namespace: gateway}
+spec:
+  podSelector: {matchLabels: {app: kong}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}
+          podSelector: {matchLabels: {app: prometheus}}
+      ports: [{protocol: TCP, port: 8100}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kong-traces-egress, namespace: gateway}
+spec:
+  podSelector: {matchLabels: {app: kong}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: observability}}
+          podSelector: {matchLabels: {app: tempo}}
+      ports: [{protocol: TCP, port: 4318}]

@@ -6,7 +6,8 @@ metadata:
 spec:
   selector: {app: ticket-service}
   ports:
-    - {name: https, port: 8443, targetPort: 8443}
+    - {name: https, port: 8443, targetPort: 8443}            # API: mTLS, only Kong may call it
+    - {name: management, port: 9090, targetPort: 9090}       # health + Prometheus metrics, plain HTTP, NetworkPolicy-restricted
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -14,7 +15,7 @@ metadata:
   name: ticket-service
   namespace: ticketing
 spec:
-  replicas: 1
+  replicas: 1                     # local: one replica (laptop resources); production: >= 2 + HPA + PDB (docs/07)
   selector:
     matchLabels: {app: ticket-service}
   template:
@@ -32,28 +33,37 @@ spec:
           imagePullPolicy: IfNotPresent
           ports:
             - {name: https, containerPort: 8443}
+            - {name: management, containerPort: 9090}
           env:
             - {name: SPRING_PROFILES_ACTIVE, value: k8s}
             - {name: POSTGRES_URL, value: "jdbc:postgresql://postgres.ticketing.svc.cluster.local:5432/ticketing"}
             - {name: POSTGRES_USER, value: ticketing_app}
             - {name: OIDC_ISSUER, value: "https://ticketing.localtest.me:8443/auth/realms/ticketing"}
             - {name: OIDC_JWKS_URI, value: "https://keycloak.auth.svc.cluster.local:8443/auth/realms/ticketing/protocol/openid-connect/certs"}
+            - {name: TRACING_ENABLED, value: "true"}    # OTLP traces to Tempo (k8s/90-observability.yaml)
+            - {name: OTEL_TRACES_ENDPOINT, value: "http://tempo.observability.svc.cluster.local:4318/v1/traces"}
           envFrom:
             - secretRef: {name: ticket-service-env}   # POSTGRES_PASSWORD, MONGODB_URI
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
             capabilities: {drop: [ALL]}
-          # TCP probes: a kubelet cannot present the client certificate that mTLS requires.
+          # HTTP probes on the management port (the API port requires an mTLS client certificate).
+          # Liveness never checks the databases (a DB outage must not cause restart storms);
+          # readiness does (takes the pod out of the Service while it cannot serve).
           startupProbe:
-            tcpSocket: {port: 8443}
+            httpGet: {path: /actuator/health/liveness, port: management}
             periodSeconds: 5
             failureThreshold: 60
+          livenessProbe:
+            httpGet: {path: /actuator/health/liveness, port: management}
+            periodSeconds: 20
+            failureThreshold: 3
           readinessProbe:
-            tcpSocket: {port: 8443}
+            httpGet: {path: /actuator/health/readiness, port: management}
             periodSeconds: 10
           resources:
-            requests: {cpu: 200m, memory: 384Mi}
+            requests: {cpu: 100m, memory: 384Mi}
             limits: {memory: 768Mi}
           volumeMounts:
             - {name: tls, mountPath: /tls, readOnly: true}

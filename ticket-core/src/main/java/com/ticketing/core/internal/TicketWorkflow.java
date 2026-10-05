@@ -183,4 +183,8 @@ public class TicketWorkflow {
     public Instant getCreatedAt() {
         return createdAt;
     }
+
+    public long getVersion() {
+        return version;
+    }
 }

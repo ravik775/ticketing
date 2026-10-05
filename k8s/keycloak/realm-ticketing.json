@@ -10,6 +10,11 @@
   "accessTokenLifespan": 300,
   "ssoSessionIdleTimeout": 1800,
   "bruteForceProtected": true,
+  "eventsEnabled": true,
+  "eventsListeners": ["jboss-logging"],
+  "eventsExpiration": 2592000,
+  "adminEventsEnabled": true,
+  "adminEventsDetailsEnabled": false,
   "groups": [
     {
       "name": "acme",

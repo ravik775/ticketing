@@ -102,6 +102,7 @@ spec:
     - keycloak.auth
     - keycloak.auth.svc
     - keycloak.auth.svc.cluster.local
+    - localhost                      # admin console via kubectl port-forward (internal only)
   usages: [server auth]
   privateKey: {algorithm: RSA, size: 2048}
   issuerRef: {name: ticketing-ca, kind: ClusterIssuer}

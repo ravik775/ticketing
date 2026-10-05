@@ -37,6 +37,10 @@ spec:
             - {name: KC_DB_USERNAME, value: keycloak}
             # Public URL users see (through Kong). Becomes the token issuer.
             - {name: KC_HOSTNAME, value: "https://ticketing.localtest.me:8443/auth"}
+            # Admin console is internal only: it is served on its own URL, reached with
+            #   kubectl -n auth port-forward svc/keycloak 9443:8443   ->   https://localhost:9443/auth/admin/
+            # The public entry point (WAF rule 1000100 + Kong route) blocks /auth/admin and the master realm.
+            - {name: KC_HOSTNAME_ADMIN, value: "https://localhost:9443/auth"}
             - {name: KC_HTTP_RELATIVE_PATH, value: /auth}
             - {name: KC_PROXY_HEADERS, value: xforwarded}
             # HTTPS for all traffic that crosses a pod boundary.
@@ -46,6 +50,11 @@ spec:
             # No NetworkPolicy allows any pod to reach it.
             - {name: KC_HTTP_ENABLED, value: "true"}
             - {name: KC_HTTP_PORT, value: "8080"}
+            # Audit: login/admin events are written to the log (jboss-logging listener) and shipped to the
+            # SIEM (Loki) - successes at INFO, failures at WARN. Enabled per realm by
+            # scripts/configure-keycloak-audit.sh (ticketing + master).
+            - {name: KC_SPI_EVENTS_LISTENER_JBOSS_LOGGING_SUCCESS_LEVEL, value: info}
+            - {name: KC_SPI_EVENTS_LISTENER_JBOSS_LOGGING_ERROR_LEVEL, value: warn}
           envFrom:
             - secretRef: {name: keycloak-env}
           securityContext:

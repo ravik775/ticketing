@@ -21,3 +21,13 @@ spring:
 ticketing:
   security:
     ssl-bundle: server    # trust the cluster CA when fetching Keycloak's JWKS
+
+management:
+  server:
+    ssl:
+      enabled: false      # management port 9090: plain HTTP for kubelet probes and Prometheus (NetworkPolicy-restricted)
+  tracing:
+    enabled: ${TRACING_ENABLED:true}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_TRACES_ENDPOINT:http://tempo.observability.svc.cluster.local:4318/v1/traces}

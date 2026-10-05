@@ -6,6 +6,21 @@ metadata:
 apiVersion: v1
 kind: Namespace
 metadata:
+  name: secrets         # OpenBao secrets manager - reachable only by External Secrets
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: external-secrets   # External Secrets Operator (k8s/vendor) - syncs OpenBao -> Kubernetes Secrets
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability   # metrics, logs (local SIEM), traces, alerting - internal only, no ingress from outside
+---
+apiVersion: v1
+kind: Namespace
+metadata:
   name: gateway
 ---
 apiVersion: v1

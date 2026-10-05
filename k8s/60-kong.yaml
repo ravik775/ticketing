@@ -10,6 +10,7 @@ spec:
   selector: {app: kong}
   ports:
     - {name: https, port: 443, targetPort: 8443}
+    - {name: status, port: 8100, targetPort: 8100}      # /metrics (Prometheus) and /status/ready; plain HTTP, NetworkPolicy-restricted
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -34,6 +35,7 @@ spec:
           image: kong:3.9
           ports:
             - {name: https, containerPort: 8443}
+            - {name: status, containerPort: 8100}
           env:
             - {name: KONG_DATABASE, value: "off"}
             - {name: KONG_DECLARATIVE_CONFIG, value: /kong/declarative/kong.yml}
@@ -45,11 +47,16 @@ spec:
             - {name: KONG_NGINX_WORKER_PROCESSES, value: "1"}
             - {name: KONG_PROXY_ACCESS_LOG, value: /dev/stdout}
             - {name: KONG_PROXY_ERROR_LOG, value: /dev/stderr}
+            # Status listener: Prometheus metrics + readiness (separate from the proxy, never exposed)
+            - {name: KONG_STATUS_LISTEN, value: "0.0.0.0:8100"}
+            # OpenTelemetry tracing (W3C traceparent) to Tempo; the opentelemetry plugin is in render-kong.sh
+            - {name: KONG_TRACING_INSTRUMENTATIONS, value: "request,balancer"}
+            - {name: KONG_TRACING_SAMPLING_RATE, value: "1.0"}
           securityContext:
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
           readinessProbe:
-            tcpSocket: {port: 8443}
+            httpGet: {path: /status/ready, port: status}    # ready only once the declarative config is loaded
             initialDelaySeconds: 5
             periodSeconds: 5
           resources:

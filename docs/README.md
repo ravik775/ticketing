@@ -15,6 +15,7 @@ does and what you should expect to see.
 | 7 | [Hosting on AWS](07-aws-deployment.md) | move the platform to AWS with a public (trusted) certificate |
 | 8 | [Security and Zero Trust](08-security-zero-trust.md) | understand every security control and why it exists |
 | 9 | [Web Application Firewall](09-waf-firewall.md) | understand, test and tune the firewall in front of the gateway |
+| – | [Enterprise gap assessment](enterprise-gap.md) | see how the platform scores against enterprise production, what was fixed and what is still open |
 
 ---
 
@@ -71,8 +72,10 @@ one command. Do **not** `export` it for the whole session: other commands (such 
 | Give a user a role | `bash scripts/add-role.sh <email> <tenant> <applicant\|approver>` |
 | Re-load the gateway configuration | `bash scripts/render-kong.sh` |
 
-Application URL: **https://ticketing.localtest.me:8443**. Keycloak admin console:
-**https://ticketing.localtest.me:8443/auth/admin**. Demo passwords are in the main [README](../README.md).
+Application URL: **https://ticketing.localtest.me:8443**. Keycloak admin console: only through a tunnel,
+`kubectl -n auth port-forward svc/keycloak 9443:8443` then **https://localhost:9443/auth/admin/** (guide 1.2).
+Database and admin passwords are random and live in OpenBao (guide 8.6); demo end-user passwords are in the
+main [README](../README.md).
 
 ## Glossary
 

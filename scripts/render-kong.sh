@@ -60,6 +60,22 @@ plugins:
         headers:
           - "X-Content-Type-Options:nosniff"
           - "Strict-Transport-Security:max-age=31536000"
+  # Metrics for SLOs (requests by service/route/status, latency histograms) on the status listener :8100
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: false
+      upstream_health_metrics: false
+      per_consumer: false
+  # Distributed tracing: spans for every request, W3C traceparent propagated to the upstreams
+  - name: opentelemetry
+    config:
+      traces_endpoint: http://tempo.observability.svc.cluster.local:4318/v1/traces
+      resource_attributes:
+        service.name: kong
+      propagation:
+        default_format: w3c
 
 services:
   # ---- Backend API: JWT verified at the edge, then mTLS to the pod ----------------------------
@@ -126,6 +142,15 @@ services:
         plugins:
           - name: rate-limiting
             config: {minute: 600, policy: local}
+      # Administration is internal only (second layer behind the WAF rule 1000100): the longer path
+      # wins over /auth, so these never reach Keycloak through the gateway.
+      - name: auth-admin-internal-only
+        paths: ["/auth/admin", "/auth/realms/master"]
+        strip_path: false
+        protocols: ["https"]
+        plugins:
+          - name: request-termination
+            config: {status_code: 403, message: "Administrative endpoint is internal only"}
 
   # ---- Static UI ---------------------------------------------------------------------------------
   - name: ui

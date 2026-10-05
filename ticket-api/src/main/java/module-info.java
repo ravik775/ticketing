@@ -12,6 +12,7 @@ module com.ticketing.api {
     requires spring.core;
     requires spring.boot;
     requires spring.boot.autoconfigure;
+    requires spring.boot.actuator.autoconfigure;   // EndpointRequest (management security chain)
     requires spring.web;
     requires spring.webmvc;
     requires spring.security.core;

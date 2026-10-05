@@ -1,4 +1,11 @@
 # Ticket details and history (document store). Authentication on; app user limited to the ticketing DB.
+#
+# LOCAL: ONE instance, run as a ONE-MEMBER REPLICA SET (same footprint as standalone). That enables the
+#   oplog, which gives point-in-time recovery, change streams and multi-document transactions.
+#   The `backup` sidecar keeps ONE backup copy: a daily full dump (with its oplog) plus 5-minute oplog
+#   slices since that dump (local RPO <= 5 minutes); scripts/restore-drill.sh replays to a chosen time.
+# PRODUCTION: 3-member replica set across AZs (MongoDB Atlas / Amazon DocumentDB), w:"majority",
+#   continuous cloud backups with PITR (docs/07, interview/03).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -13,6 +20,75 @@ data:
       roles: [{ role: 'readWrite', db: 'ticketing' }]
     });
     appDb.ticket_details.createIndex({ tenantId: 1, createdBy: 1 });
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-backup
+  namespace: ticketing
+data:
+  backup-agent.sh: |
+    #!/bin/sh
+    # Runs next to mongod (same pod, localhost). Also initiates the one-member replica set on first start.
+    set -u
+    B=/backup
+    mkdir -p "$B/base" "$B/oplog"
+    URI="mongodb://${MONGO_INITDB_ROOT_USERNAME}:${MONGO_INITDB_ROOT_PASSWORD}@localhost:27017/?authSource=admin&directConnection=true"
+    MEMBER="${RS_MEMBER_HOST:-mongo-0.mongo.ticketing.svc.cluster.local:27017}"
+    FULL_INTERVAL="${BACKUP_INTERVAL_SECONDS:-86400}"
+    SLICE_INTERVAL="${OPLOG_SLICE_SECONDS:-300}"
+    q() { mongosh --quiet "$URI" --eval "$1" 2>/dev/null; }
+
+    until q 'db.adminCommand({ping:1}).ok' | grep -q 1; do sleep 3; done
+    if ! q 'rs.status().ok' | grep -q 1; then
+      q "rs.initiate({_id:'rs0', members:[{_id:0, host:'$MEMBER'}]}).ok" && echo "replica set rs0 initiated ($MEMBER)"
+    fi
+    until q 'db.hello().isWritablePrimary' | grep -q true; do sleep 2; done
+    echo "backup agent: full dump every ${FULL_INTERVAL}s, oplog slice every ${SLICE_INTERVAL}s, one backup copy"
+
+    lastts() { q 'const d=db.getSiblingDB("local").oplog.rs.find().sort({$natural:-1}).limit(1).next(); print(d.ts.t + ":" + d.ts.i)'; }
+    while true; do
+      now=$(date +%s)
+      last_full=$(cat "$B/base/LAST_SUCCESS" 2>/dev/null || echo 0)
+      if [ $((now - last_full)) -ge "$FULL_INTERVAL" ]; then
+        if mongodump --uri "$URI" --oplog --gzip --archive="$B/base/in-progress.archive.gz" --quiet; then
+          ts=$(lastts)
+          mv "$B/base/in-progress.archive.gz" "$B/base/current.archive.gz"     # ONE backup copy
+          echo "$ts" > "$B/base/CURRENT_TS"; echo "$ts" > "$B/oplog/LAST_TS"
+          rm -rf "$B/oplog/"slice-*                                           # slices before the full dump are covered by it
+          date -u +%FT%TZ > "$B/base/TAKEN_AT"; echo "$now" > "$B/base/LAST_SUCCESS"
+          echo "full dump OK at $(cat "$B/base/TAKEN_AT") ts=$ts size $(du -h "$B/base/current.archive.gz" | cut -f1)"
+        else
+          echo "FULL DUMP FAILED" >&2
+        fi
+      elif [ -f "$B/oplog/LAST_TS" ]; then
+        from=$(cat "$B/oplog/LAST_TS"); to=$(lastts)
+        if [ -n "$to" ] && [ "$to" != "$from" ]; then
+          ft=${from%%:*}; fi_=${from##*:}; tt=${to%%:*}; ti=${to##*:}
+          dir="$B/oplog/slice-$(printf '%012d' "$tt")-$ti"
+          query="{\"ts\":{\"\$gt\":{\"\$timestamp\":{\"t\":$ft,\"i\":$fi_}},\"\$lte\":{\"\$timestamp\":{\"t\":$tt,\"i\":$ti}}}}"
+          if mongodump --uri "$URI" -d local -c oplog.rs --query "$query" --out "$dir" --quiet; then
+            echo "$to" > "$B/oplog/LAST_TS"
+          else
+            rm -rf "$dir"; echo "OPLOG SLICE FAILED" >&2
+          fi
+        fi
+      fi
+      # heartbeat for alerting (Loki rule BackupTooOld): age of the one backup copy
+      last_full=$(cat "$B/base/LAST_SUCCESS" 2>/dev/null || echo 0)
+      echo "backup status: db=mongo base_age_seconds=$(( $(date +%s) - last_full )) oplog_slices=$(ls -d "$B/oplog/"slice-* 2>/dev/null | wc -l)"
+      sleep "$SLICE_INTERVAL"
+    done
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mongo-backup                     # separate volume from the data volume
+  namespace: ticketing
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 1Gi}
 ---
 apiVersion: v1
 kind: Service
@@ -46,9 +122,23 @@ spec:
         runAsGroup: 999
         fsGroup: 999
         seccompProfile: {type: RuntimeDefault}
+      initContainers:
+        # mongod refuses a key file that is group/world readable; secret volumes are root-owned 0440 at best.
+        - name: keyfile
+          image: mongo:7
+          command: [sh, -c, "cp /keyfile-secret/mongo.key /keyfile/mongo.key && chmod 400 /keyfile/mongo.key"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          volumeMounts:
+            - {name: keyfile-secret, mountPath: /keyfile-secret, readOnly: true}
+            - {name: keyfile, mountPath: /keyfile}
       containers:
         - name: mongo
           image: mongo:7
+          # One-member replica set; small oplog and cache for the laptop. The key file authenticates
+          # replica-set members to each other (required by MongoDB when auth + replica set are combined).
+          args: [--replSet, rs0, --bind_ip_all, --keyFile, /keyfile/mongo.key, --oplogSize, "256", --wiredTigerCacheSizeGB, "0.25"]
           ports:
             - {name: mongo, containerPort: 27017}
           envFrom:
@@ -66,9 +156,35 @@ spec:
           volumeMounts:
             - {name: data, mountPath: /data/db}
             - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: keyfile, mountPath: /keyfile, readOnly: true}
+        - name: backup
+          image: mongo:7
+          command: [sh, /scripts/backup-agent.sh]
+          envFrom:
+            - secretRef: {name: mongo-credentials}
+          env:
+            - {name: BACKUP_INTERVAL_SECONDS, value: "86400"}
+            - {name: OPLOG_SLICE_SECONDS, value: "300"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 5m, memory: 32Mi}
+            limits: {memory: 256Mi}
+          volumeMounts:
+            - {name: backup, mountPath: /backup}
+            - {name: backup-scripts, mountPath: /scripts, readOnly: true}
       volumes:
         - name: init
           configMap: {name: mongo-init}
+        - name: keyfile-secret
+          secret: {secretName: mongo-keyfile}
+        - name: keyfile
+          emptyDir: {medium: Memory, sizeLimit: 1Mi}
+        - name: backup
+          persistentVolumeClaim: {claimName: mongo-backup}
+        - name: backup-scripts
+          configMap: {name: mongo-backup, defaultMode: 0555}
   volumeClaimTemplates:
     - metadata:
         name: data

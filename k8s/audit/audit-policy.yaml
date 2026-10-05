@@ -1,0 +1,40 @@
+# Kubernetes API audit policy (used by scripts/enable-k8s-audit.sh). Metadata level only: who did what to
+# which object, when, from where, with what result. Request/response bodies are never logged (they would
+# contain secret values). Shipped to the SIEM (Loki) by Alloy; detections in k8s/90-observability.yaml.
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: [RequestReceived]
+rules:
+  # --- noise
+  - level: None
+    nonResourceURLs: ["/healthz*", "/readyz*", "/livez*", "/version", "/metrics", "/openapi*", "/api", "/apis"]
+  - level: None
+    resources:
+      - {group: coordination.k8s.io, resources: [leases]}
+      - {group: "", resources: [events]}
+      - {group: events.k8s.io, resources: [events]}
+  - level: None
+    userGroups: ["system:nodes"]
+    verbs: [get, list, watch]
+  - level: None
+    users: ["system:kube-proxy", "system:kube-scheduler", "system:kube-controller-manager"]
+    verbs: [get, list, watch]
+  # --- sensitive reads and interactive access
+  - level: Metadata
+    resources:
+      - {group: "", resources: [secrets, configmaps, serviceaccounts/token]}
+  - level: Metadata
+    resources:
+      - {group: "", resources: [pods/exec, pods/portforward, pods/attach, pods/proxy, services/proxy]}
+  # --- privilege, policy and identity changes
+  - level: Metadata
+    resources:
+      - {group: rbac.authorization.k8s.io}
+      - {group: networking.k8s.io, resources: [networkpolicies]}
+      - {group: cert-manager.io}
+      - {group: admissionregistration.k8s.io}
+  # --- every other change
+  - level: Metadata
+    verbs: [create, update, patch, delete, deletecollection]
+  # --- remaining reads: not logged
+  - level: None

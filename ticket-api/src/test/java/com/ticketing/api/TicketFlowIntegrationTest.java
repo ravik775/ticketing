@@ -23,9 +23,13 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.http.MediaType;
 import org.springframework.security.oauth2.jwt.JwtDecoder;
 import org.springframework.security.test.web.servlet.request.SecurityMockMvcRequestPostProcessors.JwtRequestPostProcessor;
+import org.springframework.test.annotation.DirtiesContext;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -41,8 +45,12 @@ import org.testcontainers.junit.jupiter.Testcontainers;
  * Skipped automatically when Docker is not available.
  */
 @Testcontainers(disabledWithoutDocker = true)
-@SpringBootTest(classes = TicketingApplication.class)
+@SpringBootTest(classes = TicketingApplication.class,
+        properties = {"ticketing.outbox.relay-interval=PT1S", "ticketing.outbox.relay-initial-delay=PT1S"})
 @AutoConfigureMockMvc
+// Close the context (and its background jobs: outbox relay, metering) with this class, BEFORE Testcontainers
+// stops the databases; otherwise the cached context polls dead databases at JVM exit.
+@DirtiesContext(classMode = DirtiesContext.ClassMode.AFTER_CLASS)
 @ActiveProfiles("test")
 class TicketFlowIntegrationTest {
 
@@ -65,8 +73,72 @@ class TicketFlowIntegrationTest {
     ObjectMapper json;
     @Autowired
     DataSource dataSource;
+    @Autowired
+    MongoTemplate mongo;
     @MockitoBean
     JwtDecoder jwtDecoder;
+
+    private long outboxCount(String ticketId, String condition) throws Exception {
+        try (Connection c = dataSource.getConnection(); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT count(*) FROM ticket_outbox WHERE ticket_id = '" + ticketId + "' AND " + condition)) {
+            rs.next();
+            return rs.getLong(1);
+        }
+    }
+
+    private void sql(String statement) throws Exception {
+        try (Connection c = dataSource.getConnection(); Statement s = c.createStatement()) {
+            s.execute(statement);
+        }
+    }
+
+    private static void eventually(java.util.concurrent.Callable<Boolean> condition) throws Exception {
+        for (int i = 0; i < 100; i++) {
+            if (condition.call()) {
+                return;
+            }
+            Thread.sleep(200);
+        }
+        throw new AssertionError("condition not met within 20 s");
+    }
+
+    @Test
+    void everyChangeIsCommittedToTheOutboxAndProjectedToMongo() throws Exception {
+        var alice = user("outbox1@acme.test", "/acme/applicant");
+        var bob = user("bob@acme.test", "/acme/approver");
+        String id = createTicket(alice, "acme", "outbox happy path");
+        mvc.perform(post("/api/approvals/tickets/" + id + "/claim").with(bob)).andExpect(status().isOk());
+
+        assertThat(outboxCount(id, "true")).isEqualTo(2);                         // CREATED + CLAIMED
+        assertThat(outboxCount(id, "published_at IS NULL")).isZero();             // both projected immediately
+        mvc.perform(get("/api/tickets/" + id).with(alice))
+                .andExpect(jsonPath("$.events[*].type", hasItems("CREATED", "CLAIMED")));
+    }
+
+    /** The old silent slip: appending history to a missing Mongo document was ignored. Now it is retried and visible. */
+    @Test
+    void lostProjectionIsDetectedAndRebuiltFromTheOutbox() throws Exception {
+        var alice = user("outbox2@acme.test", "/acme/applicant");
+        var bob = user("bob@acme.test", "/acme/approver");
+        String id = createTicket(alice, "acme", "outbox recovery");
+        mvc.perform(post("/api/approvals/tickets/" + id + "/claim").with(bob)).andExpect(status().isOk());
+
+        // Simulate losing the MongoDB document. The change itself still succeeds (PostgreSQL is the source of truth) ...
+        mongo.remove(Query.query(Criteria.where("_id").is(id)), "ticket_details");
+        mvc.perform(post("/api/approvals/tickets/" + id + "/unlock").with(bob)).andExpect(status().isOk());
+        // ... and the event is NOT silently dropped: it stays pending with the reason recorded.
+        assertThat(outboxCount(id, "event_type = 'UNLOCKED' AND published_at IS NULL AND attempts >= 1 AND last_error LIKE '%does not exist%'"))
+                .isEqualTo(1);
+
+        // Rebuild the projection: mark this ticket's events for replay; the relay re-creates the document in order.
+        sql("SET app.outbox_relay = 'on'; UPDATE ticket_outbox SET published_at = NULL, attempts = 0 WHERE ticket_id = '" + id + "'");
+        eventually(() -> outboxCount(id, "published_at IS NULL") == 0);
+        mvc.perform(get("/api/tickets/" + id).with(alice))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.title").value("outbox recovery"))
+                .andExpect(jsonPath("$.events[*].type", hasItems("CREATED", "CLAIMED", "UNLOCKED")))
+                .andExpect(jsonPath("$.events.length()").value(3));                // replay is idempotent: no duplicates
+    }
 
     private static JwtRequestPostProcessor user(String email, String... groups) {
         return jwt().jwt(j -> j.claim("email", email).claim("groups", List.of(groups)));

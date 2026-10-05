@@ -118,6 +118,10 @@ expect "HTTP method the API does not use is blocked" 403
 waf -X POST "$BASE/api/tickets" -H "Authorization: Bearer $ALICE" -H 'Content-Type: text/plain' -d x
 expect "non-JSON body to the API is refused" 415
 waf -H 'Host: evil.example' "$BASE/";               expect "request for an unknown hostname is refused" 421
+waf "$BASE/auth/admin/master/console/";             expect "Keycloak admin console is not reachable from outside" 403
+waf -X POST "$BASE/auth/realms/master/protocol/openid-connect/token" -d grant_type=password -d client_id=admin-cli -d username=admin -d password=x
+expect "admin (master) realm login is not reachable from outside" 403
+waf "$BASE/auth/realms/ticketing/.well-known/openid-configuration"; expect "application realm stays reachable for sign-in" 200
 waf -I "$BASE/";                                    expect_body "responses do not reveal the proxy software version" 'erver: waf'
 
 echo; echo "== Zero Trust / network (needs kubectl access to the cluster)"

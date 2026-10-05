@@ -45,10 +45,20 @@ assigned to any tenant yet"* until an administrator gives them a role.
 
 ## 1.2 Open the Keycloak admin console
 
-1. Open **https://ticketing.localtest.me:8443/auth/admin** in a browser.
-2. The browser warns about the certificate (it is issued by our private, self-signed authority).
-   Choose *Advanced* → *Continue*.
-3. Sign in as `admin`. The password is in `k8s/kustomization.yaml` (`KC_BOOTSTRAP_ADMIN_PASSWORD`).
+The admin console is **not** reachable through the public address any more: the WAF and Kong answer
+`/auth/admin` and `/auth/realms/master` with **403**. Administrators reach it through a private tunnel.
+
+1. Open a tunnel to Keycloak (leave this terminal running):
+   ```bash
+   kubectl -n auth port-forward svc/keycloak 9443:8443
+   ```
+2. Open **https://localhost:9443/auth/admin/** in a browser. The browser warns about the certificate
+   (it is issued by our private authority). Choose *Advanced* → *Continue*.
+3. Sign in as `admin`. The password is random and lives in OpenBao; read the copy delivered to the
+   cluster:
+   ```bash
+   kubectl -n auth get secret keycloak-env -o jsonpath="{.data.KC_BOOTSTRAP_ADMIN_PASSWORD}" | base64 -d; echo
+   ```
 4. **Switch realm:** at the top of the left sidebar there is a drop-down showing *Keycloak* or
    *master*. Open it and select **ticketing**. Everything below happens in this realm.
 

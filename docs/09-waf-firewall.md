@@ -60,7 +60,7 @@ In `k8s/80-waf.yaml` → ConfigMap `waf-config` → `ticketing-before.conf` (loa
 
 | ID | Rule | Effect |
 |---|---|---|
-| 1000100 | HTTP methods: `GET HEAD POST OPTIONS` everywhere; additionally `PUT PATCH DELETE` under `/auth/admin/` (Keycloak admin console) | other methods → 403 (by CRS rule 911100) |
+| 1000100 | **Administration is internal only**: `/auth/admin…` (Keycloak admin console and REST API) and `/auth/realms/master…` (the admin realm) are refused. Only the methods the public application uses are allowed: `GET HEAD POST OPTIONS` (CRS default) | admin paths → 403 (admins use `kubectl port-forward`, guide 1.2); other methods → 403 (CRS rule 911100). Kong blocks the same paths as a second layer |
 | 1000110 | **Path allow list**: `/`, `/index.html`, `/app.js`, `/styles.css`, `/favicon.ico`, `/api/…`, `/auth…` | anything else → 404 before it reaches Kong |
 | 1000120 | API bodies must be `application/json` (requests without a body are fine) | → 415 |
 | 1000200 | **False-positive exclusion FP-1**: rule 920180 ("POST without Content-Length") is switched off for `/api/approvals/tickets/<id>/claim` and `/unlock` only | lets body-less approver actions through cleanly |

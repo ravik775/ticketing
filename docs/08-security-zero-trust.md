@@ -169,12 +169,14 @@ Keycloak or Kong.
 | Secret | Holds | Created by |
 |---|---|---|
 | `*-tls` secrets | certificates and private keys | cert-manager (automatic) |
-| `postgres-credentials`, `mongo-credentials`, `ticket-service-env`, `keycloak-env` | database and admin passwords | `k8s/kustomization.yaml` (**demo values**) |
+| `postgres-credentials`, `mongo-credentials`, `mongo-keyfile`, `ticket-service-env`, `keycloak-env`, `grafana-admin` | database, replica-set and admin credentials (random, 32 characters) | **OpenBao** (namespace `secrets`), copied in by External Secrets; each namespace can read only its own path (`scripts/secrets-bootstrap.sh`, `--rotate` to change them) |
 | `kong-declarative-config` | Kong configuration incl. its client key | `scripts/render-kong.sh` |
 | Keycloak (inside its database) | Google client secret | `scripts/set-google.sh` |
 
 Secrets are given only to the pods that need them (as environment variables or read-only files).
-Never commit real passwords; see 7.7 for AWS Secrets Manager.
+No password is stored in Git. The OpenBao root token is kept outside the repository in
+`~/.ticketing/openbao-init.json`; OpenBao's own audit device logs every read to Loki. See 7.7 for the
+AWS Secrets Manager equivalent.
 
 ## 8.7 How you can verify the controls
 
@@ -196,20 +198,22 @@ test that PostgreSQL itself refuses cross-tenant rows and owner-held locks.
 
 ## 8.8 Known gaps and accepted risks (laptop installation)
 
-Honest list of what is **not** production-grade yet, with the fix:
+Honest list of what is **not** production-grade yet, with the fix. The two former
+**accepted gaps** were closed on 2026-10-05. The full enterprise scorecard is in
+[enterprise-gap.md](enterprise-gap.md).
 
-| Gap | Risk | Fix |
-|---|---|---|
-| Demo passwords in `k8s/kustomization.yaml` (and in this repository) | anyone with the repository knows them | real secrets store (7.7), new passwords |
-| Password grant enabled on `ticketing-ui` (for `e2e.sh`) | allows password login outside the browser flow | disable in production (7.7) |
-| Keycloak admin console and `master` realm reachable through the WAF | admin login exposed to the network | block `/auth/admin` and `/auth/realms/master` publicly; admin via VPN/port-forward |
-| Database connections not encrypted inside the cluster | traffic visible to someone with node access | TLS to RDS/DocumentDB on AWS (7.6) or a service mesh |
-| Kong → UI over plain HTTP | static files only, inside the cluster | TLS on the UI pod or serve from S3/CloudFront |
-| Any namespace may request a certificate from the cluster-wide CA (including the name `kong-gateway`) | a rogue workload with that ability could impersonate Kong at the TLS level | NetworkPolicy already blocks it; also use a namespaced Issuer or cert-manager approver-policy |
-| Renewed certificates need `scripts/reload-certs.sh` | service outage when the old certificate expires if forgotten | monthly routine (guide 5); automatic reload (5.8) |
-| Users identified by email address | a changed/reused email changes who owns tickets | key identities on the token's `sub` |
-| Java module boundaries checked at build time only | not enforced by the JVM at run time | acceptable; code review + build checks |
-| Rate-limit counters per Kong copy; real client IP hidden by the laptop load balancer | per-IP limits impossible on the laptop | Redis policy and ALB client IPs on AWS (7.3, 7.5) |
-| Images (except the WAF) referenced by tag, not digest | a changed upstream image could be pulled | pin digests / private registry (7.7) |
-| Keycloak login events off by default | less evidence after an incident | enable (guide 2, 2.6) |
-| No backups, single replicas | data loss / downtime | AWS managed databases and replicas (7.8) |
+| Gap | Risk | Fix | Status |
+|---|---|---|---|
+| Demo passwords in `k8s/kustomization.yaml` (and in the GitHub repository) | anyone with the repository knows them | real secrets store (7.7), new passwords | **Closed**: credentials live in OpenBao, delivered by External Secrets, rotated to random values; demo *end-user* passwords remain in the realm import for testing |
+| Password grant enabled on `ticketing-ui` (for `e2e.sh`) | allows password login outside the browser flow | disable in production (7.7) | open |
+| Keycloak admin console and `master` realm reachable through the WAF | admin login exposed to the network | block `/auth/admin` and `/auth/realms/master` publicly; admin via VPN/port-forward | **Closed**: WAF rule 1000100 and a Kong route return 403; admins use `kubectl port-forward` (guide 1); failed master-realm logins raise an alert |
+| Database connections not encrypted inside the cluster | traffic visible to someone with node access | TLS to RDS/DocumentDB on AWS (7.6) or a service mesh | open |
+| Kong → UI over plain HTTP | static files only, inside the cluster | TLS on the UI pod or serve from S3/CloudFront | open |
+| Any namespace may request a certificate from the cluster-wide CA (including the name `kong-gateway`) | a rogue workload with that ability could impersonate Kong at the TLS level | NetworkPolicy already blocks it; also use a namespaced Issuer or cert-manager approver-policy | open |
+| Renewed certificates need `scripts/reload-certs.sh` | service outage when the old certificate expires if forgotten | monthly routine (guide 5); automatic reload (5.8) | open, mitigated: `CertificateExpiresSoon` / `CertificateNotReady` alerts |
+| Users identified by email address | a changed/reused email changes who owns tickets | key identities on the token's `sub` | open |
+| Java module boundaries checked at build time only | not enforced by the JVM at run time | acceptable; code review + build checks | open |
+| Rate-limit counters per Kong copy; real client IP hidden by the laptop load balancer | per-IP limits impossible on the laptop | Redis policy and ALB client IPs on AWS (7.3, 7.5) | open |
+| Images (except the WAF) referenced by tag, not digest | a changed upstream image could be pulled | pin digests / private registry (7.7) | open |
+| Keycloak login events off by default | less evidence after an incident | enable (guide 2, 2.6) | open |
+| No backups, single replicas | data loss / downtime | AWS managed databases and replicas (7.8) | open |

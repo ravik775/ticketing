@@ -101,11 +101,12 @@ data:
 
   # Custom ModSecurity rules, loaded as a CRS plugin BEFORE the CRS rules. IDs 1000000-1000999.
   ticketing-before.conf: |
-    # 1. Only the HTTP methods this application uses. The SPA, the API and the login pages need
-    #    GET/HEAD/POST/OPTIONS (the CRS default). The Keycloak admin console also uses PUT/PATCH/DELETE.
-    SecRule REQUEST_URI "@beginsWith /auth/admin/" \
-        "id:1000100,phase:1,pass,nolog,t:none,\
-        setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
+    # 1. Administration is internal only: the Keycloak admin console/REST API and the admin (master) realm
+    #    are never served on the public entry point (admins use kubectl port-forward, docs/01). Only the
+    #    HTTP methods the public application uses are allowed (CRS default GET/HEAD/POST/OPTIONS).
+    SecRule REQUEST_FILENAME "@rx ^/auth/(?:admin(?:/|$)|realms/master(?:/|$))" \
+        "id:1000100,phase:1,deny,status:403,log,t:none,t:lowercase,\
+        msg:'Administrative endpoint is internal only',tag:'ticketing/basic-firewall'"
 
     # 2. Positive model for paths: only what the application actually serves. Everything else
     #    (scanners probing /wp-admin, /.git, /actuator, /phpmyadmin ...) never reaches Kong.
@@ -147,7 +148,7 @@ spec:
       annotations:
         # Rules are mounted with subPath, which does NOT update a running pod. After editing the
         # ConfigMap above, bump this number so `kubectl apply -k k8s` restarts the WAF.
-        ticketing/config-version: "2"
+        ticketing/config-version: "3"
     spec:
       automountServiceAccountToken: false
       securityContext:

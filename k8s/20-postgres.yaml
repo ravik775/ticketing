@@ -1,4 +1,13 @@
 # Structured data: Keycloak's database + tenant registry + ticket workflow state (with Row-Level Security).
+#
+# LOCAL: ONE instance (no replica, laptop resources) + point-in-time recovery (PITR):
+#   - WAL archiving: every completed WAL segment is gzip-copied to a SEPARATE backup volume
+#     (archive_timeout = 5 min bounds the data-loss window: local RPO <= 5 minutes);
+#   - the `backup` sidecar takes one base backup a day and keeps ONE backup copy (latest base backup +
+#     the WAL needed to roll it forward), pruning older WAL with pg_archivecleanup;
+#   - scripts/restore-drill.sh restores into a throw-away pod to a chosen time and verifies it.
+# PRODUCTION: Amazon RDS for PostgreSQL Multi-AZ (synchronous standby), automated backups + PITR,
+#   cross-region snapshot copies, optional read replica (docs/07, interview/03).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,6 +23,62 @@ data:
       CREATE ROLE ticketing_app LOGIN PASSWORD '${TICKETING_DB_PASSWORD}';
       CREATE DATABASE ticketing OWNER ticketing_app;
     SQL
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-backup
+  namespace: ticketing
+data:
+  backup-agent.sh: |
+    #!/bin/sh
+    # Runs next to PostgreSQL (same pod, same uid, unix socket: no network access needed).
+    set -u
+    B=/backup
+    mkdir -p "$B/wal" "$B/base"
+    INTERVAL="${BACKUP_INTERVAL_SECONDS:-86400}"
+    echo "backup agent: base backup every ${INTERVAL}s, keeping one backup copy in $B"
+    while true; do
+      if ! pg_isready -h /var/run/postgresql -q; then
+        sleep 10; continue                                           # database still starting
+      fi
+      last=$(cat "$B/base/LAST_SUCCESS" 2>/dev/null || echo 0)
+      now=$(date +%s)
+      if [ $((now - last)) -ge "$INTERVAL" ]; then
+        rm -rf "$B/base/in-progress"
+        if pg_basebackup -h /var/run/postgresql -U postgres -D "$B/base/in-progress" -Ft -z -X stream -c fast \
+             -l "scheduled base backup $(date -u +%FT%TZ)"; then
+          date -u +%FT%TZ > "$B/base/in-progress/TAKEN_AT"
+          rm -rf "$B/base/previous"; [ -d "$B/base/current" ] && mv "$B/base/current" "$B/base/previous"
+          mv "$B/base/in-progress" "$B/base/current"
+          rm -rf "$B/base/previous"                                  # ONE backup copy
+          psql -h /var/run/postgresql -U postgres -qAtc "select pg_switch_wal()" >/dev/null
+          sleep 5
+          label=$(ls -t "$B/wal/"*.backup.gz 2>/dev/null | head -1)
+          if [ -n "$label" ]; then
+            pg_archivecleanup -x .gz "$B/wal" "$(basename "$label" .gz)" && echo "pruned WAL older than $(basename "$label" .gz)"
+          fi
+          echo "$now" > "$B/base/LAST_SUCCESS"
+          echo "base backup OK at $(cat "$B/base/current/TAKEN_AT"), size $(du -sh "$B/base/current" | cut -f1)"
+        else
+          echo "BASE BACKUP FAILED" >&2
+        fi
+      fi
+      # heartbeat for alerting (Loki rule BackupTooOld): age of the one backup copy
+      last=$(cat "$B/base/LAST_SUCCESS" 2>/dev/null || echo 0)
+      echo "backup status: db=postgres base_age_seconds=$(( $(date +%s) - last )) wal_files=$(ls "$B/wal" | wc -l)"
+      sleep 300
+    done
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-backup                  # separate volume from the data volume
+  namespace: ticketing
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests: {storage: 2Gi}
 ---
 apiVersion: v1
 kind: Service
@@ -50,6 +115,13 @@ spec:
       containers:
         - name: postgres
           image: postgres:16
+          args:
+            - "-c"
+            - "archive_mode=on"
+            - "-c"
+            - "archive_command=mkdir -p /backup/wal && test ! -f /backup/wal/%f.gz && gzip -c %p > /backup/wal/%f.gz.tmp && mv /backup/wal/%f.gz.tmp /backup/wal/%f.gz"
+            - "-c"
+            - "archive_timeout=300"
           ports:
             - {name: pg, containerPort: 5432}
           env:
@@ -70,11 +142,31 @@ spec:
             - {name: data, mountPath: /var/lib/postgresql/data}
             - {name: init, mountPath: /docker-entrypoint-initdb.d}
             - {name: run, mountPath: /var/run/postgresql}
+            - {name: backup, mountPath: /backup}
+        - name: backup
+          image: postgres:16
+          command: [sh, /scripts/backup-agent.sh]
+          env:
+            - {name: BACKUP_INTERVAL_SECONDS, value: "86400"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          resources:
+            requests: {cpu: 5m, memory: 16Mi}
+            limits: {memory: 128Mi}
+          volumeMounts:
+            - {name: run, mountPath: /var/run/postgresql}
+            - {name: backup, mountPath: /backup}
+            - {name: backup-scripts, mountPath: /scripts, readOnly: true}
       volumes:
         - name: init
           configMap: {name: postgres-init, defaultMode: 0555}
         - name: run
           emptyDir: {}
+        - name: backup
+          persistentVolumeClaim: {claimName: postgres-backup}
+        - name: backup-scripts
+          configMap: {name: postgres-backup, defaultMode: 0555}
   volumeClaimTemplates:
     - metadata:
         name: data

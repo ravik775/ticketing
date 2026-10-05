@@ -23,6 +23,8 @@ module com.ticketing.core {
     requires jakarta.persistence;
     requires jakarta.validation;
     requires org.hibernate.orm.core;
+    requires org.mongodb.driver.core;
+    requires micrometer.core;
     requires org.slf4j;
 
     exports com.ticketing.core;

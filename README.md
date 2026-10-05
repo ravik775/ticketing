@@ -36,16 +36,20 @@ Browser ──HTTPS──► WAF (only entry point: ModSecurity + OWASP CRS, TLS
 | `edge` | Web Application Firewall (nginx + ModSecurity v3 + OWASP CRS 4), the only public service |
 | `gateway` | Kong OSS (DB-less, declarative config) |
 | `auth` | Keycloak |
-| `ticketing` | ticket-service, ui, PostgreSQL, MongoDB |
+| `ticketing` | ticket-service, ui, PostgreSQL, MongoDB (each with a backup sidecar) |
+| `secrets` | OpenBao (secrets manager; holds every database and admin credential) |
+| `external-secrets` | External Secrets Operator (copies credentials from OpenBao into Kubernetes Secrets) |
+| `observability` | Prometheus, Alertmanager, Loki (logs + local SIEM rules), Tempo (traces), Grafana, Alloy |
 
 ### Why two databases
 * **PostgreSQL** holds the *structured, transactional* data: the tenant registry, each ticket's workflow row
   (status, lock holder, owner, optimistic-lock version) and Keycloak's own database. The lock/approval rules
   need atomic, constrained updates, which fits a relational store (and its Row-Level Security).
 * **MongoDB** holds the *flexible ticket content*: details and the embedded history/comments.
-* They are separate stores, so there is no cross-database transaction. `TicketService` writes the Mongo
-  document first and deletes it if the Postgres insert fails; later history events are appended after the
-  Postgres change commits (a failure there is logged). For this demo that is a deliberate, documented trade-off.
+* They are separate stores, so there is no cross-database transaction. Every workflow change writes an event
+  to the **`ticket_outbox`** table in the *same* PostgreSQL transaction; the event is then projected into
+  MongoDB idempotently (immediately, and by a relay every 5 s that retries failures). A lost MongoDB write is
+  repaired automatically, and a growing backlog or a dead event raises an alert.
 
 ## Security model
 
@@ -69,20 +73,26 @@ Maven dependencies. The hostname `ticketing.localtest.me` resolves to 127.0.0.1 
 ## Run
 
 ```bash
-mvn verify            # compiles the three modules and runs the tests
-bash scripts/up.sh    # cluster + images + cert-manager + everything; takes a few minutes
-bash scripts/e2e.sh   # 53 end-to-end checks through the WAF and Kong, incl. WAF, mTLS and NetworkPolicy checks
-bash scripts/down.sh  # delete the cluster
+./mvnw verify                         # compiles the three modules, runs the 43 tests (fails if any is skipped)
+bash scripts/up.sh                    # cluster + audit + images + cert-manager + OpenBao + everything; a few minutes
+bash scripts/e2e.sh                   # 56 end-to-end checks (WAF, mTLS, NetworkPolicy, admin lockdown, workflow)
+bash scripts/verify-observability.sh  # 15 checks: metrics, logs, traces, alert rules, a simulated attack alert
+bash scripts/restore-drill.sh all     # point-in-time restore of PostgreSQL and MongoDB into throwaway pods
+bash scripts/load-test.sh             # k6 load test (runs in Docker)
+bash scripts/down.sh                  # delete the cluster
 ```
 
 Open **https://ticketing.localtest.me:8443** (self-signed certificate: accept the browser warning).
 
 | User | Password | Role |
 |---|---|---|
-| alice | `Passw0rd!` | applicant in **acme** *and* **globex** |
+| alice | `Passw0rd!` (demo end users only; database and admin passwords are random, see below) | applicant in **acme** *and* **globex** |
 | erin | `Passw0rd!` | applicant in acme |
 | bob, carol | `Passw0rd!` | approvers in acme |
 | dave | `Passw0rd!` | approver in globex |
+
+Grafana: `kubectl -n observability port-forward svc/grafana 3000:3000` → http://localhost:3000 (user `admin`,
+password in Secret `observability/grafana-admin`): dashboards, alerts and traces.
 
 Try: sign in as alice, raise a ticket in acme → sign in as bob (private window), pick it up → carol cannot
 pick it up or decide → carol unlocks it, picks it up and approves → alice sees the outcome and comments.
@@ -116,8 +126,23 @@ Keycloak's NetworkPolicy allows outbound HTTPS to public addresses for this (the
 server-side); private and cluster ranges stay blocked.
 
 Google users start with **no tenant** and get a clear message in the UI until an administrator adds them to a
-group (e.g. `/acme/applicant`) in the Keycloak admin console (`https://ticketing.localtest.me:8443/auth/admin`,
-user `admin`, demo password in `k8s/kustomization.yaml`).
+group (e.g. `/acme/applicant`), with `bash scripts/add-role.sh <email> <tenant> <role>` or in the Keycloak admin
+console. The console is blocked on the public address (403); open it through a tunnel:
+`kubectl -n auth port-forward svc/keycloak 9443:8443` → https://localhost:9443/auth/admin/ (user `admin`; password:
+`kubectl -n auth get secret keycloak-env -o jsonpath="{.data.KC_BOOTSTRAP_ADMIN_PASSWORD}" | base64 -d`).
+
+## Secrets, backups, observability and CI/CD
+
+| Concern | Implementation | Main script / file |
+|---|---|---|
+| Secrets | OpenBao (Raft, TLS, audit device) → External Secrets Operator, one store per namespace; no passwords in Git. The OpenBao root token is kept outside the repository in `~/.ticketing/openbao-init.json` | `scripts/secrets-bootstrap.sh` (`--rotate` changes every credential and restarts consumers) |
+| Backups / PITR | PostgreSQL WAL archiving + daily base backup; MongoDB 1-member replica set + full dump + 5-minute oplog slices; one backup copy each | `scripts/restore-drill.sh` |
+| Observability | Metrics (Prometheus), logs (Loki), traces (Tempo, from Kong and the service), Grafana dashboard, SLO burn-rate alerts, `Watchdog` | `k8s/90-observability.yaml`, `scripts/verify-observability.sh` |
+| Audit | Kubernetes API audit, Keycloak user/admin events, WAF audit log, all in Loki with detection rules | `scripts/enable-k8s-audit.sh`, `scripts/configure-keycloak-audit.sh` |
+| Tenant fairness | Per-tenant requests/minute and concurrency quotas (429), 5 s statement timeout, daily usage metering | `tenant` / `tenant_usage` tables |
+| CI/CD | GitHub Actions: build + tests (no skips), Trivy, SBOM, cosign signing, k3d end-to-end; release workflow with a protected environment | `.github/workflows/` |
+
+Enterprise readiness and the remaining gaps: [docs/enterprise-gap.md](docs/enterprise-gap.md).
 
 ## Repository layout
 
@@ -128,21 +153,25 @@ ticket-core/               TicketService facade (exported); entity, Postgres + M
 ticket-api/                REST controllers, Spring Security (JWT, mTLS identity, tenant filter), Dockerfile
 ui/                        static SPA (PKCE login, applicant and approver views) + Dockerfile
 docs/                      operations handbook for maintainers (start at docs/README.md)
-k8s/                       kustomize: namespaces, cert-manager PKI, Postgres, MongoDB, Keycloak (+realm), service, ui, Kong, NetworkPolicies, WAF
-scripts/                   up.sh, down.sh, render-kong.sh, e2e.sh, set-google.sh, add-role.sh, reload-certs.sh
+k8s/                       kustomize: namespaces, PKI, OpenBao, External Secrets, Postgres, MongoDB, Keycloak (+realm), service, ui, Kong, NetworkPolicies, WAF, observability
+scripts/                   up/down, render-kong, e2e, secrets-bootstrap, restore-drill, verify-observability, load-test, set-google, add-role, reload-certs
+.github/workflows/         ci.yml (build, scan, e2e, images), release.yml (signed release, gated deploy)
+interview/                 interview question bank built on this system
 ```
 
 ## Known limits (deliberate, to keep the demo small)
 
-* **Demo credentials** are in `k8s/kustomization.yaml`; the Keycloak client allows the password grant only so
-  `e2e.sh` can fetch tokens with curl. Remove both for anything real.
+* **Demo end users** (`Passw0rd!`) come from the realm import, and the Keycloak client allows the password grant
+  only so `e2e.sh` can fetch tokens with curl. Remove both for anything real.
 * PostgreSQL and MongoDB traffic is plain inside the cluster and protected by NetworkPolicies only (add TLS or a
   service mesh next). The UI is served over plain HTTP between Kong and the nginx pod.
 * JPMS is enforced at **compile time**: Spring Boot runs the fat jar on the classpath, so the boundary is not
   re-enforced by the JVM at runtime.
 * Kong holds a single JWT verification key read from Keycloak at deploy time; re-run `scripts/render-kong.sh`
   if the realm's signing key changes. The cert-manager certificates are valid 90 days (CA 10 years).
-* Single replicas, no backups. Kubelet TCP probes are used because mTLS prevents HTTP probes.
+* Single replicas by decision (to save laptop resources): PostgreSQL and MongoDB are protected by point-in-time
+  backups rather than replicas, and the one backup copy sits on the same node. Health probes use a separate
+  plain-HTTP management port (9090) that only the kubelet and Prometheus can reach.
 * Rate-limit counters are local to each Kong pod (`policy: local`); with several Kong replicas use the
   `redis` policy so a user's quota is shared.
 * The UI renews its 5-minute access token with the refresh token (kept in memory only). If the SSO session

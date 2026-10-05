@@ -5,6 +5,12 @@ spring:
     url: ${POSTGRES_URL:jdbc:postgresql://localhost:5432/ticketing}
     username: ${POSTGRES_USER:ticketing_app}
     password: ${POSTGRES_PASSWORD:ticketing_app}
+    hikari:
+      maximum-pool-size: ${DB_POOL_SIZE:10}
+      data-source-properties:
+        # Noisy-neighbour guard: no single statement (any tenant) may hold a connection for long, and an
+        # abandoned transaction cannot keep locks. Applied to every pooled connection.
+        options: "-c statement_timeout=${DB_STATEMENT_TIMEOUT_MS:5000} -c idle_in_transaction_session_timeout=${DB_IDLE_TX_TIMEOUT_MS:30000}"
   data:
     mongodb:
       uri: ${MONGODB_URI:mongodb://localhost:27017/ticketing}
@@ -27,8 +33,49 @@ ticketing:
   mtls:
     enabled: true            # fail closed by default
     allowed-callers: kong-gateway
+  outbox:
+    relay-interval: ${OUTBOX_RELAY_INTERVAL:PT5S}   # retry cadence for history events not yet in MongoDB
+    max-attempts: 50
+  tenant-quota:
+    cache-ttl: PT60S                                  # quotas come from the tenant table (tier, requests_per_minute, max_concurrent)
+  metering:
+    flush-interval: PT60S                             # per-tenant usage -> tenant_usage table
 
 server:
   error:
     include-message: never
     include-stacktrace: never
+
+# Health and metrics on a separate plain-HTTP port: probes and Prometheus cannot present the mTLS
+# client certificate that the API port (8443) requires. NetworkPolicy restricts who reaches it.
+management:
+  server:
+    port: ${MANAGEMENT_PORT:9090}
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true                    # enables latency SLO queries (histogram_quantile)
+      slo:
+        http.server.requests: 250ms,500ms,1s,2s       # exact buckets for the latency SLO (99 % of API calls < 1 s)
+  tracing:
+    enabled: ${TRACING_ENABLED:false}                 # on in the cluster (k8s profile), off for tests/laptop runs
+    sampling:
+      probability: ${TRACING_SAMPLING:1.0}
+  otlp:
+    tracing:
+      endpoint: ${OTEL_TRACES_ENDPOINT:http://localhost:4318/v1/traces}
+
+logging:
+  pattern:
+    correlation: "[${spring.application.name:},%X{traceId:-},%X{spanId:-},cid=%X{correlationId:-}] "

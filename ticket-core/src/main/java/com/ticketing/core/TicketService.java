@@ -1,20 +1,22 @@
 package com.ticketing.core;
 
 import com.ticketing.core.internal.DocumentStore;
+import com.ticketing.core.internal.OutboxPublisher;
+import com.ticketing.core.internal.OutboxStore.OutboxEvent;
 import com.ticketing.core.internal.TicketDocument;
-import com.ticketing.core.internal.TicketDocument.EventDoc;
 import com.ticketing.core.internal.TicketWorkflow;
 import com.ticketing.core.internal.WorkflowStore;
+import com.ticketing.core.internal.WorkflowStore.Change;
+import com.ticketing.core.internal.WorkflowStore.EventSpec;
+import com.ticketing.core.internal.WorkflowStore.NewTicket;
 import com.ticketing.security.Role;
 import com.ticketing.security.TenantContext;
 import com.ticketing.security.TenantContextHolder;
 import java.time.Duration;
-import java.time.Instant;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
+import java.util.function.Function;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.OptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
@@ -27,30 +29,34 @@ import org.springframework.stereotype.Service;
  * though the web layer also checks them (defence in depth).
  *
  * <p>Storage split: workflow/lock state in PostgreSQL ({@link WorkflowStore}), ticket details and
- * comments in MongoDB ({@link DocumentStore}). They are separate databases, so there is no single
- * transaction: create writes Mongo first and compensates if Postgres fails; later events are
- * appended after the Postgres change commits (a failure there is logged, not rolled back).
+ * history in MongoDB ({@link DocumentStore}). PostgreSQL is the source of truth: every change commits
+ * its history event to a transactional outbox in the same transaction; the event is then projected
+ * into MongoDB immediately, and retried by the relay if that fails ({@link OutboxPublisher}). History is
+ * therefore never lost; at worst it appears a few seconds late.
  */
 @Service
 public class TicketService {
-
-    private static final Logger log = LoggerFactory.getLogger(TicketService.class);
 
     /** Largest page a list endpoint returns; also bounds the MongoDB $in query built from it. */
     public static final int MAX_PAGE_SIZE = 200;
 
     private final WorkflowStore workflows;
     private final DocumentStore documents;
+    private final OutboxPublisher publisher;
+    private final TenantUsageMeter usage;
     private final Duration lockTimeout;
 
     /**
      * @param lockTimeout after this long a lock is stale and another approver may take it over;
      *                    zero (the default) keeps locks until they are decided or explicitly unlocked
      */
-    public TicketService(WorkflowStore workflows, DocumentStore documents,
+    public TicketService(WorkflowStore workflows, DocumentStore documents, OutboxPublisher publisher,
+                         TenantUsageMeter usage,
                          @Value("${ticketing.lock-timeout:PT0S}") Duration lockTimeout) {
         this.workflows = workflows;
         this.documents = documents;
+        this.publisher = publisher;
+        this.usage = usage;
         this.lockTimeout = lockTimeout;
     }
 
@@ -58,24 +64,20 @@ public class TicketService {
 
     public TicketView create(CreateTicketRequest request) {
         TenantContext ctx = require(Role.APPLICANT);
-        UUID id = UUID.randomUUID();
-        Instant now = Instant.now();
-        documents.insert(new TicketDocument(id.toString(), ctx.tenantId(), request.title(), request.mobile(),
-                request.description(), ctx.email(), now, List.of(new EventDoc("CREATED", ctx.email(), null, now))));
-        TicketWorkflow workflow;
-        try {
-            workflow = workflows.insert(id);
-        } catch (RuntimeException e) {
-            try {
-                documents.delete(id);
-            } catch (RuntimeException compensation) {
-                // Keep the original failure as the cause the caller sees.
-                e.addSuppressed(compensation);
-                log.warn("Ticket {} could not be removed from MongoDB after the Postgres insert failed", id, compensation);
-            }
-            throw e;
+        Change change = workflows.insert(UUID.randomUUID(),
+                new NewTicket(request.title(), request.mobile(), request.description()));
+        publisher.publishNow(change.event());
+        usage.recordTicketCreated(ctx.tenantId());
+        TicketWorkflow workflow = change.workflow();
+        TicketDocument details = documents.findByIds(List.of(workflow.getId())).get(workflow.getId());
+        if (details == null) {
+            // MongoDB is unavailable right now: answer from the committed event; the relay will project it.
+            OutboxEvent e = change.event();
+            details = new TicketDocument(workflow.getId().toString(), ctx.tenantId(), e.title(), e.mobile(),
+                    e.description(), ctx.email(), e.occurredAt(),
+                    List.of(new TicketDocument.EventDoc(e.id().toString(), e.type(), e.actor(), null, e.occurredAt())));
         }
-        return viewOf(List.of(workflow)).get(0);
+        return toView(workflow, details);
     }
 
     public List<TicketView> myTickets(int page, int size) {
@@ -92,9 +94,10 @@ public class TicketService {
     public TicketView respond(UUID id, CommentRequest request) {
         TenantContext ctx = require(Role.APPLICANT);
         ownedBy(ctx, workflows.get(id));
-        TicketWorkflow updated = mutate(id, TicketWorkflow::respond);
-        record(id, "RESPONDED", ctx.email(), request.comment());
-        return viewOf(List.of(updated)).get(0);
+        return mutate(id, w -> {
+            w.respond();
+            return new EventSpec("RESPONDED", request.comment());
+        });
     }
 
     // ---------------------------------------------------------------- approver
@@ -112,27 +115,24 @@ public class TicketService {
     /** Pick up (lock) a ticket. Approvers can never pick up a ticket they raised themselves (403). */
     public TicketView claim(UUID id) {
         TenantContext ctx = require(Role.APPROVER);
-        String[] takenOver = new String[1];
-        TicketWorkflow updated = mutate(id, w -> takenOver[0] = w.claim(ctx.email(), lockTimeout));
-        record(id, "CLAIMED", ctx.email(),
-                takenOver[0] == null ? null : "Stale lock held by " + takenOver[0] + " taken over");
-        return viewOf(List.of(updated)).get(0);
+        return mutate(id, w -> {
+            String takenOver = w.claim(ctx.email(), lockTimeout);
+            return new EventSpec("CLAIMED", takenOver == null ? null : "Stale lock held by " + takenOver + " taken over");
+        });
     }
 
     /** Release a lock, including one held by another approver of the same tenant. */
     public TicketView unlock(UUID id) {
         TenantContext ctx = require(Role.APPROVER);
-        String[] previous = new String[1];
-        TicketWorkflow updated = mutate(id, w -> previous[0] = w.unlock(ctx.email()));
-        record(id, "UNLOCKED", ctx.email(), "Lock held by " + previous[0] + " released");
-        return viewOf(List.of(updated)).get(0);
+        return mutate(id, w -> new EventSpec("UNLOCKED", "Lock held by " + w.unlock(ctx.email()) + " released"));
     }
 
     public TicketView decide(UUID id, DecisionRequest request) {
         TenantContext ctx = require(Role.APPROVER);
-        TicketWorkflow updated = mutate(id, w -> w.decide(ctx.email(), request.decision()));
-        record(id, request.decision().name(), ctx.email(), request.comment());
-        return viewOf(List.of(updated)).get(0);
+        return mutate(id, w -> {
+            w.decide(ctx.email(), request.decision());
+            return new EventSpec(request.decision().name(), request.comment());
+        });
     }
 
     // ---------------------------------------------------------------- helpers
@@ -167,20 +167,16 @@ public class TicketService {
         return workflow;
     }
 
-    private TicketWorkflow mutate(UUID id, java.util.function.Consumer<TicketWorkflow> change) {
+    /** Runs the transition with its outbox event in one transaction, then projects the event. */
+    private TicketView mutate(UUID id, Function<TicketWorkflow, EventSpec> transition) {
+        Change change;
         try {
-            return workflows.update(id, change);
+            change = workflows.update(id, transition);
         } catch (OptimisticLockingFailureException e) {
             throw new TicketConflictException("Ticket was modified by someone else; reload and retry");
         }
-    }
-
-    private void record(UUID id, String type, String actor, String comment) {
-        try {
-            documents.appendEvent(id, new EventDoc(type, actor, comment, Instant.now()));
-        } catch (RuntimeException e) {
-            log.warn("Ticket {} changed in Postgres but event '{}' could not be written to MongoDB", id, type, e);
-        }
+        publisher.publishNow(change.event());
+        return viewOf(List.of(change.workflow())).get(0);
     }
 
     private List<TicketView> viewOf(List<TicketWorkflow> rows) {
