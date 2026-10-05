@@ -1,0 +1,52 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# Applied after cert-manager is installed (scripts/up.sh). The Kong declarative-config Secret is
+# produced by scripts/render-kong.sh because it embeds the Keycloak public key and Kong's client cert.
+resources:
+  - 00-namespaces.yaml
+  - 10-pki.yaml
+  - 20-postgres.yaml
+  - 21-mongo.yaml
+  - 30-keycloak.yaml
+  - 40-ticket-service.yaml
+  - 50-ui.yaml
+  - 60-kong.yaml
+  - 70-network-policies.yaml
+  - 80-waf.yaml
+
+generatorOptions:
+  disableNameSuffixHash: true
+
+configMapGenerator:
+  - name: keycloak-realm
+    namespace: auth
+    files:
+      - realm-ticketing.json=keycloak/realm-ticketing.json
+
+# DEMO CREDENTIALS ONLY. Replace (and stop committing them) for anything beyond a laptop demo.
+secretGenerator:
+  - name: postgres-credentials
+    namespace: ticketing
+    literals:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=pgAdminDemo1
+      - KEYCLOAK_DB_PASSWORD=kcDbDemo1
+      - TICKETING_DB_PASSWORD=ticketsDbDemo1
+  - name: mongo-credentials
+    namespace: ticketing
+    literals:
+      - MONGO_INITDB_ROOT_USERNAME=mongoadmin
+      - MONGO_INITDB_ROOT_PASSWORD=mongoAdminDemo1
+      - MONGO_APP_PASSWORD=mongoAppDemo1
+  - name: ticket-service-env
+    namespace: ticketing
+    literals:
+      - POSTGRES_PASSWORD=ticketsDbDemo1
+      - MONGODB_URI=mongodb://ticketing_app:mongoAppDemo1@mongo.ticketing.svc.cluster.local:27017/ticketing?authSource=ticketing
+  - name: keycloak-env
+    namespace: auth
+    literals:
+      - KC_DB_PASSWORD=kcDbDemo1
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=adminDemo1

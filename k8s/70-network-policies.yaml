@@ -1,0 +1,252 @@
+# Default deny (ingress AND egress) in every namespace, then explicit allows only.
+# Traffic map:
+#   internet -> waf:8443 (edge)
+#   waf -> kong:8443
+#   kong -> ui:8080 | ticket-service:8443 (mTLS) | keycloak:8443
+#   ticket-service -> postgres:5432 | mongo:27017 | keycloak:8443 (JWKS)
+#   keycloak -> postgres:5432 | public internet :443 (Google identity brokering)
+# Enforced by k3s' built-in network policy controller.
+
+# ------------------------------------------------------------------ edge (WAF)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: edge}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: edge}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: waf-ingress-from-anywhere, namespace: edge}
+spec:
+  podSelector: {matchLabels: {app: waf}}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: waf-egress, namespace: edge}
+spec:
+  podSelector: {matchLabels: {app: waf}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+      ports: [{protocol: TCP, port: 8443}]
+---
+# ------------------------------------------------------------------ gateway
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: gateway}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: gateway}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kong-ingress-from-waf, namespace: gateway}
+spec:
+  podSelector: {matchLabels: {app: kong}}
+  policyTypes: [Ingress]
+  ingress:
+    # Only the WAF: nothing can reach Kong without passing the firewall first.
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: edge}}
+          podSelector: {matchLabels: {app: waf}}
+      ports:
+        - {protocol: TCP, port: 8443}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: kong-egress, namespace: gateway}
+spec:
+  podSelector: {matchLabels: {app: kong}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: ticket-service}}
+      ports: [{protocol: TCP, port: 8443}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: ui}}
+      ports: [{protocol: TCP, port: 8080}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: auth}}
+          podSelector: {matchLabels: {app: keycloak}}
+      ports: [{protocol: TCP, port: 8443}]
+---
+# ------------------------------------------------------------------ auth
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: auth}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: auth}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keycloak-ingress, namespace: auth}
+spec:
+  podSelector: {matchLabels: {app: keycloak}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: ticket-service}}
+      ports: [{protocol: TCP, port: 8443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: keycloak-egress, namespace: auth}
+spec:
+  podSelector: {matchLabels: {app: keycloak}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: ticketing}}
+          podSelector: {matchLabels: {app: postgres}}
+      ports: [{protocol: TCP, port: 5432}]
+    # Identity brokering (Google): Keycloak exchanges the authorization code and fetches Google's
+    # keys server-side, so it needs HTTPS to the internet. Private ranges (pods, services, the
+    # k3d/docker host network) stay blocked, so this opens no new path into the cluster.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16, 100.64.0.0/10]
+      ports: [{protocol: TCP, port: 443}]
+---
+# ------------------------------------------------------------------ ticketing
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: default-deny-all, namespace: ticketing}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: allow-dns, namespace: ticketing}
+spec:
+  podSelector: {}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
+          podSelector: {matchLabels: {k8s-app: kube-dns}}
+      ports:
+        - {protocol: UDP, port: 53}
+        - {protocol: TCP, port: 53}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ticket-service-ingress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: ticket-service}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+      ports: [{protocol: TCP, port: 8443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ticket-service-egress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: ticket-service}}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector: {matchLabels: {app: postgres}}
+      ports: [{protocol: TCP, port: 5432}]
+    - to:
+        - podSelector: {matchLabels: {app: mongo}}
+      ports: [{protocol: TCP, port: 27017}]
+    - to:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: auth}}
+          podSelector: {matchLabels: {app: keycloak}}
+      ports: [{protocol: TCP, port: 8443}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: ui-ingress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: ui}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: gateway}}
+          podSelector: {matchLabels: {app: kong}}
+      ports: [{protocol: TCP, port: 8080}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: postgres-ingress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: postgres}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: ticket-service}}
+        - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: auth}}
+          podSelector: {matchLabels: {app: keycloak}}
+      ports: [{protocol: TCP, port: 5432}]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata: {name: mongo-ingress, namespace: ticketing}
+spec:
+  podSelector: {matchLabels: {app: mongo}}
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector: {matchLabels: {app: ticket-service}}
+      ports: [{protocol: TCP, port: 27017}]

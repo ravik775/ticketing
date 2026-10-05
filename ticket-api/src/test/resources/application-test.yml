@@ -1,0 +1,6 @@
+ticketing:
+  mtls:
+    enabled: false
+spring:
+  flyway:
+    enabled: true

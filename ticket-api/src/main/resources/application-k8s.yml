@@ -1,0 +1,23 @@
+# Active in the cluster (SPRING_PROFILES_ACTIVE=k8s). Certificates are issued by cert-manager and
+# mounted at /tls (tls.crt, tls.key, ca.crt).
+server:
+  port: 8443
+  ssl:
+    enabled: true
+    bundle: server
+    client-auth: need     # mTLS: the TLS handshake fails without a client certificate signed by our CA
+
+spring:
+  ssl:
+    bundle:
+      pem:
+        server:
+          keystore:
+            certificate: file:/tls/tls.crt
+            private-key: file:/tls/tls.key
+          truststore:
+            certificate: file:/tls/ca.crt
+
+ticketing:
+  security:
+    ssl-bundle: server    # trust the cluster CA when fetching Keycloak's JWKS

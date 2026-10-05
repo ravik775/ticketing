@@ -1,0 +1,209 @@
+# Web Application Firewall in front of Kong: nginx + ModSecurity v3 + OWASP Core Rule Set (CRS) 4.
+#
+#   browser --TLS--> waf (edge ns) --TLS, certificate verified--> kong (gateway ns) --> ...
+#
+# The WAF is now the ONLY component exposed outside the cluster (LoadBalancer :443). Kong became a
+# ClusterIP service that only the WAF may reach (k8s/70-network-policies.yaml). See docs/09-waf-firewall.md.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: waf-config
+  namespace: edge
+data:
+  # Replaces the image's default server. Placeholders like ${VAR} would be filled by envsubst, so
+  # nginx variables are written without braces ($host, not ${host}).
+  default.conf.template: |
+    server_tokens off;
+    more_set_headers 'Server: waf';
+
+    # One line per request; request_id is also sent to Kong as X-Correlation-ID, so a request can
+    # be followed through the WAF, Kong and the error response the user sees.
+    log_format waf '$time_iso8601 client=$remote_addr id=$request_id host=$host "$request" '
+                   'status=$status bytes=$body_bytes_sent upstream=$upstream_status '
+                   'time=$request_time ua="$http_user_agent"';
+
+    upstream kong {
+        server kong.gateway.svc.cluster.local:443;
+        keepalive 16;
+    }
+
+    # Catch-all: requests that do not name our hostname are refused (stops IP scans and Host-header
+    # games). Also answers the kubelet health probe, which uses the pod IP as Host.
+    server {
+        listen 8443 ssl default_server;
+        http2 on;
+        server_name _;
+        ssl_certificate     /tls/tls.crt;
+        ssl_certificate_key /tls/tls.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        access_log /dev/stdout waf;
+
+        location = /healthz {
+            modsecurity off;
+            access_log off;
+            default_type text/plain;
+            return 200 "OK\n";
+        }
+        location / {
+            modsecurity off;
+            return 421;
+        }
+    }
+
+    server {
+        listen 8443 ssl;
+        http2 on;
+        server_name ticketing.localtest.me localhost;
+
+        # --- TLS for browsers (certificate from cert-manager, see k8s/10-pki.yaml) ---
+        ssl_certificate     /tls/tls.crt;
+        ssl_certificate_key /tls/tls.key;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+        ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache   shared:WafTLS:10m;
+        ssl_session_tickets off;
+
+        # --- Basic firewall limits (slow / oversized requests are cut off before ModSecurity) ---
+        client_max_body_size        1m;     # same limit as Kong's request-size-limiting
+        client_body_timeout         10s;
+        client_header_timeout       10s;
+        large_client_header_buffers 4 16k;
+        keepalive_timeout           30s;
+        send_timeout                30s;
+
+        access_log /dev/stdout waf;
+
+        location / {
+            proxy_pass https://kong;
+
+            # Zero Trust on this hop too: Kong's certificate must be signed by the cluster CA and be
+            # valid for the public hostname, otherwise the WAF refuses to talk to it.
+            proxy_ssl_verify              on;
+            proxy_ssl_verify_depth        2;
+            proxy_ssl_trusted_certificate /tls/ca.crt;
+            proxy_ssl_name                ticketing.localtest.me;
+            proxy_ssl_server_name         on;
+            proxy_ssl_protocols           TLSv1.2 TLSv1.3;
+            proxy_ssl_session_reuse       on;
+
+            proxy_http_version 1.1;
+            proxy_set_header Connection        "";
+            proxy_set_header Host              $http_host;
+            proxy_set_header X-Real-IP         $remote_addr;
+            proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header X-Correlation-ID  $request_id;
+            proxy_connect_timeout 5s;
+            proxy_read_timeout    60s;
+            proxy_send_timeout    60s;
+        }
+    }
+
+  # Custom ModSecurity rules, loaded as a CRS plugin BEFORE the CRS rules. IDs 1000000-1000999.
+  ticketing-before.conf: |
+    # 1. Only the HTTP methods this application uses. The SPA, the API and the login pages need
+    #    GET/HEAD/POST/OPTIONS (the CRS default). The Keycloak admin console also uses PUT/PATCH/DELETE.
+    SecRule REQUEST_URI "@beginsWith /auth/admin/" \
+        "id:1000100,phase:1,pass,nolog,t:none,\
+        setvar:'tx.allowed_methods=GET HEAD POST OPTIONS PUT PATCH DELETE'"
+
+    # 2. Positive model for paths: only what the application actually serves. Everything else
+    #    (scanners probing /wp-admin, /.git, /actuator, /phpmyadmin ...) never reaches Kong.
+    SecRule REQUEST_FILENAME "!@rx ^/(?:$|index\.html$|app\.js$|styles\.css$|favicon\.ico$|api/|auth(?:/|$))" \
+        "id:1000110,phase:1,deny,status:404,log,t:none,\
+        msg:'Path is not part of the application',tag:'ticketing/basic-firewall'"
+
+    # 3. The API only accepts JSON bodies. (Calls without a body, such as claim/unlock, send no
+    #    Content-Type and are allowed.)
+    SecRule REQUEST_URI "@beginsWith /api/" \
+        "id:1000120,phase:1,deny,status:415,log,t:none,chain,\
+        msg:'API request body must be application/json',tag:'ticketing/basic-firewall'"
+        SecRule &REQUEST_HEADERS:Content-Type "@gt 0" "chain"
+            SecRule REQUEST_HEADERS:Content-Type "!@rx ^application/json(?:\s*;|$)" "t:lowercase"
+
+    # --- Runtime exclusions for false positives (must run before the CRS rule they disable) ---
+    # FP-1: claim/unlock are POSTs without a body; some clients then send no Content-Length,
+    #       which CRS rule 920180 scores (3 points). Disable that ONE rule for these TWO endpoints only.
+    SecRule REQUEST_URI "@rx ^/api/approvals/tickets/[0-9a-fA-F-]{36}/(?:claim|unlock)$" \
+        "id:1000200,phase:1,pass,nolog,t:none,ctl:ruleRemoveById=920180"
+
+  # Configure-time exclusions (loaded AFTER the CRS rules), e.g. SecRuleUpdateTargetById to stop a
+  # rule inspecting one parameter everywhere. Path-specific exclusions go in ticketing-before.conf.
+  ticketing-after.conf: |
+    # (none needed at paranoia level 1; see docs/09-waf-firewall.md "Handling a false positive")
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: waf
+  namespace: edge
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: waf}
+  template:
+    metadata:
+      labels: {app: waf}
+      annotations:
+        # Rules are mounted with subPath, which does NOT update a running pod. After editing the
+        # ConfigMap above, bump this number so `kubectl apply -k k8s` restarts the WAF.
+        ticketing/config-version: "2"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101          # "nginx" user of the image
+        runAsGroup: 101
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: waf
+          # Pinned by digest (OWASP CRS 4.30.0, nginx 1.30.5). Update deliberately, see the docs.
+          image: owasp/modsecurity-crs:nginx-alpine@sha256:f12da37e72e29d1f06e7e829780f1016606d0799eac2966e58ef3819a3d30a50
+          ports:
+            - {name: https, containerPort: 8443}
+          env:
+            - {name: MODSEC_RULE_ENGINE, value: "On"}         # "DetectionOnly" = log but never block
+            - {name: BLOCKING_PARANOIA, value: "1"}            # CRS paranoia level 1..4 (higher = stricter, more false positives)
+            - {name: DETECTION_PARANOIA, value: "1"}
+            - {name: ANOMALY_INBOUND, value: "5"}              # block when a request scores >= 5
+            - {name: ANOMALY_OUTBOUND, value: "4"}
+            - {name: MODSEC_REQ_BODY_LIMIT, value: "1048576"}  # 1 MiB
+            - {name: MODSEC_AUDIT_ENGINE, value: "RelevantOnly"}
+            # Audit log WITHOUT request headers/bodies: they would contain passwords, cookies and
+            # bearer tokens. A = timing/client/URI, H = matched rules, Z = end.
+            - {name: MODSEC_AUDIT_LOG_PARTS, value: "AHZ"}
+            - {name: LOGLEVEL, value: "warn"}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: 8443, scheme: HTTPS}
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests: {cpu: 100m, memory: 128Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+            - {name: config, mountPath: /etc/nginx/templates/conf.d/default.conf.template, subPath: default.conf.template, readOnly: true}
+            - {name: config, mountPath: /etc/modsecurity.d/owasp-crs/plugins/ticketing-before.conf, subPath: ticketing-before.conf, readOnly: true}
+            - {name: config, mountPath: /etc/modsecurity.d/owasp-crs/plugins/ticketing-after.conf, subPath: ticketing-after.conf, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: waf-edge-tls}
+        - name: config
+          configMap: {name: waf-config}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: waf
+  namespace: edge
+spec:
+  type: LoadBalancer          # k3d maps host :8443 -> this service's :443
+  selector: {app: waf}
+  ports:
+    - {name: https, port: 443, targetPort: 8443}

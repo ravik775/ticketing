@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.5.6</version>
+    <relativePath/>
+  </parent>
+
+  <groupId>com.ticketing</groupId>
+  <artifactId>ticketing-parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <name>Multi-tenant Ticketing</name>
+
+  <modules>
+    <module>ticket-security</module>
+    <module>ticket-core</module>
+    <module>ticket-api</module>
+  </modules>
+
+  <properties>
+    <java.version>21</java.version>
+    <maven.compiler.release>21</maven.compiler.release>
+  </properties>
+
+  <build>
+    <pluginManagement>
+      <plugins>
+        <plugin>
+          <groupId>org.apache.maven.plugins</groupId>
+          <artifactId>maven-surefire-plugin</artifactId>
+          <configuration>
+            <!-- Production code is compiled as named JPMS modules (compile-time encapsulation);
+                 tests run on the classpath so Spring/Mockito/Testcontainers work unchanged. -->
+            <useModulePath>false</useModulePath>
+            <!-- Docker Engine 29+ rejects the old default API version of Testcontainers' docker-java
+                 client (it answers /info with an empty 400), so Docker looks "unavailable". -->
+            <systemPropertyVariables>
+              <api.version>1.44</api.version>
+            </systemPropertyVariables>
+          </configuration>
+        </plugin>
+      </plugins>
+    </pluginManagement>
+  </build>
+</project>

@@ -1,0 +1,13 @@
+target/
+*.class
+.idea/
+.vscode/
+*.iml
+
+# Secrets and key material: never commit
+client_secret*.json
+*.pem
+*.key
+*.p12
+*.pfx
+.env

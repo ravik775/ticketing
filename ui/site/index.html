@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ticketing</title>
+  <!-- External stylesheet only: the Content-Security-Policy (ui/default.conf) allows no inline styles. -->
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div id="error" role="alert"></div>
+  <header id="bar" hidden>
+    <h1>Ticketing</h1>
+    <span id="who" class="meta"></span>
+    <label for="tenant" class="meta">Tenant</label>
+    <select id="tenant"></select>
+    <button class="ghost" id="logout">Sign out</button>
+  </header>
+  <div id="welcome" hidden>
+    <h1>Ticketing</h1>
+    <p class="meta">Sign in to raise or approve tickets for your tenant.</p>
+    <div class="row">
+      <button id="login">Sign in</button>
+      <button class="ghost" id="login-google">Sign in with Google</button>
+    </div>
+  </div>
+  <main id="app" hidden></main>
+  <script src="app.js"></script>
+</body>
+</html>

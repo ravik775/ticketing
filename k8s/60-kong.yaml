@@ -1,0 +1,71 @@
+# Kong OSS, DB-less. The declarative config (routes, JWT consumer/public key, mTLS client cert) is
+# rendered by scripts/render-kong.sh into the Secret "kong-declarative-config".
+apiVersion: v1
+kind: Service
+metadata:
+  name: kong
+  namespace: gateway
+spec:
+  type: ClusterIP             # internal only: the WAF (k8s/80-waf.yaml) is the public entry point
+  selector: {app: kong}
+  ports:
+    - {name: https, port: 443, targetPort: 8443}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kong
+  namespace: gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: kong}
+  template:
+    metadata:
+      labels: {app: kong}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: kong
+          image: kong:3.9
+          ports:
+            - {name: https, containerPort: 8443}
+          env:
+            - {name: KONG_DATABASE, value: "off"}
+            - {name: KONG_DECLARATIVE_CONFIG, value: /kong/declarative/kong.yml}
+            - {name: KONG_PROXY_LISTEN, value: "0.0.0.0:8443 ssl http2"}
+            - {name: KONG_ADMIN_LISTEN, value: "off"}
+            - {name: KONG_SSL_CERT, value: /tls-edge/tls.crt}
+            - {name: KONG_SSL_CERT_KEY, value: /tls-edge/tls.key}
+            - {name: KONG_PREFIX, value: /kong_prefix}
+            - {name: KONG_NGINX_WORKER_PROCESSES, value: "1"}
+            - {name: KONG_PROXY_ACCESS_LOG, value: /dev/stdout}
+            - {name: KONG_PROXY_ERROR_LOG, value: /dev/stderr}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            tcpSocket: {port: 8443}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 192Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: edge-tls, mountPath: /tls-edge, readOnly: true}
+            - {name: declarative, mountPath: /kong/declarative, readOnly: true}
+            - {name: prefix, mountPath: /kong_prefix}
+            - {name: tmp, mountPath: /tmp}
+      volumes:
+        - name: edge-tls
+          secret: {secretName: kong-edge-tls}
+        - name: declarative
+          secret: {secretName: kong-declarative-config}
+        - name: prefix
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}

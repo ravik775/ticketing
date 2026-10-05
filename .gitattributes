@@ -1,0 +1,5 @@
+# Keep LF line endings in the repository and in checkouts: bash scripts fail with CRLF ("\r: command
+# not found"), and the YAML/nginx/ModSecurity files are mounted into Linux containers.
+* text=auto eol=lf
+*.cmd text eol=crlf
+*.bat text eol=crlf

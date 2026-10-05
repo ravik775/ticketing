@@ -1,0 +1,78 @@
+# Ticket details and history (document store). Authentication on; app user limited to the ticketing DB.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mongo-init
+  namespace: ticketing
+data:
+  10-init-app-user.js: |
+    const appDb = db.getSiblingDB('ticketing');
+    appDb.createUser({
+      user: 'ticketing_app',
+      pwd: process.env.MONGO_APP_PASSWORD,
+      roles: [{ role: 'readWrite', db: 'ticketing' }]
+    });
+    appDb.ticket_details.createIndex({ tenantId: 1, createdBy: 1 });
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo
+  namespace: ticketing
+spec:
+  clusterIP: None
+  selector: {app: mongo}
+  ports:
+    - {name: mongo, port: 27017, targetPort: 27017}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongo
+  namespace: ticketing
+spec:
+  serviceName: mongo
+  replicas: 1
+  selector:
+    matchLabels: {app: mongo}
+  template:
+    metadata:
+      labels: {app: mongo}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: mongo
+          image: mongo:7
+          ports:
+            - {name: mongo, containerPort: 27017}
+          envFrom:
+            - secretRef: {name: mongo-credentials}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            tcpSocket: {port: 27017}
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 256Mi}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data/db}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+      volumes:
+        - name: init
+          configMap: {name: mongo-init}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}

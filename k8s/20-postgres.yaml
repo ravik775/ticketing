@@ -1,0 +1,84 @@
+# Structured data: Keycloak's database + tenant registry + ticket workflow state (with Row-Level Security).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-init
+  namespace: ticketing
+data:
+  10-init-databases.sh: |
+    #!/bin/bash
+    set -e
+    psql -v ON_ERROR_STOP=1 --username "$POSTGRES_USER" --dbname postgres <<SQL
+      CREATE ROLE keycloak LOGIN PASSWORD '${KEYCLOAK_DB_PASSWORD}';
+      CREATE DATABASE keycloak OWNER keycloak;
+      CREATE ROLE ticketing_app LOGIN PASSWORD '${TICKETING_DB_PASSWORD}';
+      CREATE DATABASE ticketing OWNER ticketing_app;
+    SQL
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: ticketing
+spec:
+  clusterIP: None
+  selector: {app: postgres}
+  ports:
+    - {name: pg, port: 5432, targetPort: 5432}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: ticketing
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: {app: postgres}
+  template:
+    metadata:
+      labels: {app: postgres}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: postgres
+          image: postgres:16
+          ports:
+            - {name: pg, containerPort: 5432}
+          env:
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          envFrom:
+            - secretRef: {name: postgres-credentials}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          readinessProbe:
+            exec: {command: [pg_isready, -U, postgres]}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          resources:
+            requests: {cpu: 100m, memory: 192Mi}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            - {name: init, mountPath: /docker-entrypoint-initdb.d}
+            - {name: run, mountPath: /var/run/postgresql}
+      volumes:
+        - name: init
+          configMap: {name: postgres-init, defaultMode: 0555}
+        - name: run
+          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests: {storage: 1Gi}

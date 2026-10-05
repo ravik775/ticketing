@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+  namespace: auth
+spec:
+  selector: {app: keycloak}
+  ports:
+    - {name: https, port: 8443, targetPort: 8443}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+  namespace: auth
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: keycloak}
+  template:
+    metadata:
+      labels: {app: keycloak}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile: {type: RuntimeDefault}
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.3
+          args: ["start", "--import-realm"]
+          ports:
+            - {name: https, containerPort: 8443}
+          env:
+            - {name: KC_DB, value: postgres}
+            - {name: KC_DB_URL, value: "jdbc:postgresql://postgres.ticketing.svc.cluster.local:5432/keycloak"}
+            - {name: KC_DB_USERNAME, value: keycloak}
+            # Public URL users see (through Kong). Becomes the token issuer.
+            - {name: KC_HOSTNAME, value: "https://ticketing.localtest.me:8443/auth"}
+            - {name: KC_HTTP_RELATIVE_PATH, value: /auth}
+            - {name: KC_PROXY_HEADERS, value: xforwarded}
+            # HTTPS for all traffic that crosses a pod boundary.
+            - {name: KC_HTTPS_CERTIFICATE_FILE, value: /tls/tls.crt}
+            - {name: KC_HTTPS_CERTIFICATE_KEY_FILE, value: /tls/tls.key}
+            # Plain HTTP on 8080 exists ONLY for in-pod admin scripts (kubectl exec -> localhost).
+            # No NetworkPolicy allows any pod to reach it.
+            - {name: KC_HTTP_ENABLED, value: "true"}
+            - {name: KC_HTTP_PORT, value: "8080"}
+          envFrom:
+            - secretRef: {name: keycloak-env}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: [ALL]}
+          startupProbe:
+            tcpSocket: {port: 8443}
+            periodSeconds: 5
+            failureThreshold: 90
+          readinessProbe:
+            tcpSocket: {port: 8443}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 250m, memory: 768Mi}
+            limits: {memory: 1536Mi}
+          volumeMounts:
+            - {name: tls, mountPath: /tls, readOnly: true}
+            - {name: realm, mountPath: /opt/keycloak/data/import, readOnly: true}
+      volumes:
+        - name: tls
+          secret: {secretName: keycloak-tls}
+        - name: realm
+          configMap: {name: keycloak-realm}

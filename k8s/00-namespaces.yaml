@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: edge            # WAF (ModSecurity + OWASP CRS): the only component reachable from outside
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gateway
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: auth
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ticketing
