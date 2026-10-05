@@ -1,5 +1,5 @@
 # Build the jar first:  mvn -q -DskipTests package   (scripts/up.sh does this)
-FROM eclipse-temurin:21-jre
+FROM eclipse-temurin:25-jre
 RUN useradd --system --uid 10001 --no-create-home app
 COPY target/ticket-service.jar /app/ticket-service.jar
 USER 10001
