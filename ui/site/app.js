@@ -176,6 +176,60 @@ function pagedList(fetchPage, renderItem, emptyText) {
   return { el, reload, reset: () => { pages = 1; } };
 }
 
+/**
+ * A list shown one numbered page at a time (Previous / Next). The API returns plain lists without a
+ * total, so "is there a next page?" is answered by asking for the single item just after this page.
+ */
+function pagerList(fetchPage, renderItem, emptyText, sizes = [10, 20, 50]) {
+  const el = h('div');
+  const items = h('div');
+  let page = 0;
+  let size = sizes[0];
+
+  // The same controls above and below the list, so long pages need no scrolling to navigate.
+  const bars = ['top', 'bottom'].map((where) => {
+    const bar = {
+      status: h('span', { class: 'meta', 'aria-live': where === 'top' ? 'polite' : 'off' }),
+      prev: h('button', { class: 'ghost', onclick: () => go(page - 1) }, '‹ Previous'),
+      next: h('button', { class: 'ghost', onclick: () => go(page + 1) }, 'Next ›'),
+      size: h('select', { 'aria-label': 'Tickets per page' },
+        ...sizes.map((s) => h('option', { value: String(s) }, `${s} per page`))),
+    };
+    bar.size.addEventListener('change', () => { size = Number(bar.size.value); go(0); });
+    bar.el = h('div', { class: `pager ${where}` }, bar.prev, bar.status, bar.next, bar.size);
+    return bar;
+  });
+  el.append(bars[0].el, items, bars[1].el);
+
+  async function hasItemAt(offset) {   // page=offset with size=1 is exactly the item at that offset
+    return (await fetchPage(offset, 1)).length > 0;
+  }
+
+  async function reload() {
+    let rows = await fetchPage(page, size);
+    while (!rows.length && page > 0) {   // the last item of a page went away (e.g. after a decision)
+      page--;
+      rows = await fetchPage(page, size);
+    }
+    const more = rows.length === size && await hasItemAt((page + 1) * size);
+    items.replaceChildren(...(rows.length ? rows.map(renderItem) : [h('p', { class: 'meta' }, emptyText)]));
+    const first = page * size + 1;
+    for (const bar of bars) {
+      bar.status.textContent = rows.length ? `Page ${page + 1} · tickets ${first}–${first + rows.length - 1}` : '';
+      bar.prev.disabled = page === 0;
+      bar.next.disabled = !more;
+      bar.size.value = String(size);
+    }
+  }
+
+  function go(p) {
+    page = Math.max(0, p);
+    reload().catch(showError);
+  }
+
+  return { el, reload, reset: () => { page = 0; } };
+}
+
 // ---------- views ----------
 const when = (iso) => (iso ? new Date(iso).toLocaleString() : '');
 
@@ -223,6 +277,7 @@ async function renderApplicant(root) {
       h('p', { class: 'meta' }, 'Your email and tenant are taken from your sign-in, not from this form.')),
     h('section', {}, h('h2', {}, 'My tickets'), list.el));
   await list.reload();
+  return list;
 }
 
 async function renderApprover(root) {
@@ -236,7 +291,7 @@ async function renderApprover(root) {
     await list.reload().catch(showError);
   }
 
-  const list = pagedList((page, size) => api(`/approvals/tickets?page=${page}&size=${size}`
+  const list = pagerList((page, size) => api(`/approvals/tickets?page=${page}&size=${size}`
       + (filter.value ? `&status=${encodeURIComponent(filter.value)}` : '')), (t) => {
     // Separation of duties (also enforced by the server): no approver actions on your own ticket.
     if (t.createdBy === me.email) {
@@ -255,26 +310,87 @@ async function renderApprover(root) {
         h('button', { class: 'ghost', onclick: () => decide('REQUEST_INFO') }, 'Request more details')));
     }
     return ticketCard(t, h('div', {}, h('div', { class: 'row' }, buttons), decision));
-  }, 'No tickets.');
+  }, 'No tickets match this filter.');
 
   filter.addEventListener('change', () => { list.reset(); list.reload().catch(showError); });
-  root.append(h('section', {}, h('h2', {}, 'Approval queue'), filter, list.el));
+  root.append(h('section', {}, h('h2', {}, 'Approval queue'),
+    h('label', {}, 'Status'), filter, list.el));
   await list.reload();
+  return list;
+}
+
+// ---------- tabs ----------
+const TABS = [
+  { id: 'raise', label: 'Raise ticket', role: 'APPLICANT', render: renderApplicant,
+    noRole: 'You are not an applicant in this tenant, so you cannot raise tickets here.' },
+  { id: 'approve', label: 'Approvals', role: 'APPROVER', render: renderApprover,
+    noRole: 'You are not an approver in this tenant, so there is no approval queue for you here.' },
+];
+
+function savedTab() {
+  try { return localStorage.getItem('tab'); } catch { return null; }
 }
 
 /** Builds the view off-screen; a render started earlier (e.g. before a tenant switch) is discarded. */
 async function renderApp() {
   const seq = ++renderSeq;
-  const view = document.createDocumentFragment();
   const roles = (me.tenants[tenant] || []);
+  if (!roles.length) {
+    $('app').replaceChildren(h('section', {}, 'You have no role in this tenant.'));
+    return;
+  }
+
+  const tabBar = h('div', { class: 'tabs', role: 'tablist', 'aria-label': 'Views' });
+  const panels = {};
+  const buttons = {};
+  const reloaders = {};
+  const allowed = TABS.filter((t) => roles.includes(t.role)).map((t) => t.id);
+  let active = allowed.includes(savedTab()) ? savedTab() : allowed[0];
+
+  function select(id, focus = false, reload = true) {
+    active = id;
+    try { localStorage.setItem('tab', id); } catch { /* storage unavailable */ }
+    for (const t of TABS) {
+      const on = t.id === id;
+      buttons[t.id].setAttribute('aria-selected', String(on));
+      buttons[t.id].tabIndex = on ? 0 : -1;
+      panels[t.id].hidden = !on;
+    }
+    if (focus) buttons[id].focus();
+    if (reload && reloaders[id]) reloaders[id]().catch(showError);   // fresh data each time a tab is opened
+  }
+
+  for (const t of TABS) {
+    buttons[t.id] = h('button', {
+      class: 'tab', role: 'tab', id: `tab-${t.id}`, 'aria-controls': `panel-${t.id}`,
+      onclick: () => select(t.id),
+      onkeydown: (e) => {   // arrow keys move between tabs (WAI-ARIA tabs pattern)
+        if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+        const i = TABS.findIndex((x) => x.id === t.id);
+        select(TABS[(i + (e.key === 'ArrowRight' ? 1 : TABS.length - 1)) % TABS.length].id, true);
+      },
+    }, t.label, roles.includes(t.role) ? null : h('span', { class: 'meta' }, ' (no access)'));
+    panels[t.id] = h('div', { class: 'panel', role: 'tabpanel', id: `panel-${t.id}`, 'aria-labelledby': `tab-${t.id}` });
+    tabBar.append(buttons[t.id]);
+  }
+
+  const view = document.createDocumentFragment();
+  view.append(tabBar, ...TABS.map((t) => panels[t.id]));
   try {
-    if (roles.includes('APPLICANT')) await renderApplicant(view);
-    if (roles.includes('APPROVER')) await renderApprover(view);
-    if (!roles.length) view.append(h('section', {}, 'You have no role in this tenant.'));
+    for (const t of TABS) {
+      if (!roles.includes(t.role)) {
+        panels[t.id].append(h('section', {}, h('p', { class: 'meta' }, t.noRole)));
+        continue;
+      }
+      const list = await t.render(panels[t.id]);
+      if (list) reloaders[t.id] = list.reload;
+    }
   } catch (e) {
     if (seq === renderSeq) showError(e);
   }
-  if (seq === renderSeq) $('app').replaceChildren(view);
+  if (seq !== renderSeq) return;
+  select(active, false, false);   // just loaded; no need to fetch it twice
+  $('app').replaceChildren(view);
 }
 
 async function start() {

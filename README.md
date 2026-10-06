@@ -1,178 +1,346 @@
-# Multi-Tenant Ticketing on Kubernetes (Kong + Keycloak + Spring Boot)
+# Multi-Tenant Ticketing Platform: Zero Trust SaaS reference on Kubernetes
 
-A multi-tenant ticketing application that demonstrates, end to end, how an enterprise stack fits
-together on a single-node Kubernetes cluster (k3d/k3s) on a laptop.
+[![CI](https://github.com/ravik775/ticketing/actions/workflows/ci.yml/badge.svg)](https://github.com/ravik775/ticketing/actions/workflows/ci.yml)
 
-* **Applicants** raise tickets (title, mobile number, description) and see only their own.
-  Email and tenant come from the security context, never from the request body.
-* **Approvers** work at tenant level: they see every ticket of the tenant and can only
-  *Approve*, *Reject* or *Request more details*, always with a comment. They cannot raise tickets.
-* A ticket picked up by an approver is **locked**; no other approver can act on it until it is
-  **unlocked** (any approver of the tenant may unlock), after which they can pick it up and approve it.
-* One user may belong to **several tenants**, with a different role in each.
-* **Separation of duties:** a user who is both applicant and approver in a tenant can never pick up, unlock or
-  decide a ticket they raised themselves (403). Enforced in the domain model and by a database constraint.
+A multi-tenant ticket and approval application built the way an enterprise SaaS platform is built:
+a Web Application Firewall, an API gateway, OpenID Connect sign-in, mutual TLS between services,
+row-level tenant isolation in the database, secrets management, backups with point-in-time recovery,
+full observability with security alerting, and a CI/CD pipeline. It runs end to end on one laptop
+(k3s via k3d), and every production concern is documented with how it maps to AWS.
 
-> **Operations handbook:** step-by-step guides for maintainers (users and roles, logs, databases,
-> architecture, certificates, OpenSSL, AWS, security, WAF) are in **[docs/](docs/README.md)**.
+---
+
+## At a glance
+
+| | |
+|---|---|
+| **What it does** | Employees of several companies (tenants) raise tickets; approvers in each company pick them up, lock them and approve, reject or ask for more details |
+| **Architecture style** | Modular Spring Boot service behind an edge WAF and API gateway; Zero Trust (every hop authenticated); shared database with row-level security per tenant |
+| **Runs on** | Kubernetes (k3s). Locally a single-node k3d cluster; production design for AWS EKS in [docs/07](docs/07-aws-deployment.md) |
+| **Quality evidence** | 43 automated tests (0 skipped), 56 live end-to-end checks, 15 observability checks, a restore drill, a k6 load-test baseline (36.6 req/s, p95 109 ms, 0 % errors on a laptop) |
+| **Documentation** | an operations handbook for maintainers ([docs/](docs/README.md)), an [enterprise gap assessment](docs/enterprise-gap.md), and an [interview/architecture question bank](interview/README.md) |
+
+### Highlights
+
+* **Zero Trust, layer by layer:** WAF (OWASP CRS) → TLS with certificate verification → API gateway (JWT, per-user rate limit) → **mTLS** with a pinned client identity → the service re-validates the token → **forced PostgreSQL row-level security**. Every layer is tested independently.
+* **Correct across two databases:** a **transactional outbox** keeps PostgreSQL (workflow) and MongoDB (documents) consistent without distributed transactions; lost writes are detected and repaired automatically.
+* **Noisy-neighbour protection:** per-tenant request and concurrency quotas, database statement timeouts and per-tenant usage metering.
+* **Operable:** metrics, logs, traces, SLO burn-rate alerts and a local SIEM (Kubernetes audit, Keycloak events, WAF blocks) with detection rules proven to fire.
+* **Recoverable and secret-free:** WAL/oplog backups with a point-in-time restore drill; all credentials in OpenBao (Vault-compatible) and rotated; none in Git.
+* **Shippable:** GitHub Actions with a no-skipped-tests gate, vulnerability scanning, SBOM, signed images and an in-pipeline Kubernetes end-to-end test.
+
+### Technology stack
+
+| Area | Technology |
+|---|---|
+| Backend | Java 21, Spring Boot 3.5 (Web, Security OAuth2 Resource Server, Data JPA, Data MongoDB, Actuator), Java Platform Module System, Flyway, Micrometer + OpenTelemetry |
+| Frontend | Dependency-free single-page app (vanilla JavaScript, OIDC Authorization Code + PKCE), nginx with a strict Content-Security-Policy |
+| Data | PostgreSQL 16 (workflow state, row-level security, transactional outbox), MongoDB 7 (ticket documents and history) |
+| Identity | Keycloak 26 (OIDC, Google sign-in brokering, per-tenant groups as roles) |
+| Edge and gateway | nginx + ModSecurity v3 + OWASP Core Rule Set 4 (WAF), Kong Gateway OSS 3.9 (DB-less) |
+| Platform | Kubernetes (k3s 1.35 via k3d), Kustomize, cert-manager (private CA, mTLS), NetworkPolicies, OpenBao + External Secrets Operator |
+| Observability | Prometheus, Alertmanager, Loki, Tempo, Grafana, Grafana Alloy, kube-state-metrics |
+| Delivery and testing | GitHub Actions, Maven wrapper, JUnit 5, Testcontainers, Trivy, Syft (SBOM), cosign, k6, Dependabot |
+
+---
+
+## What the application does
+
+* **Applicants** raise tickets (title, mobile number, description) and see only their own. Their email
+  and tenant come from the sign-in, never from the form.
+* **Approvers** see every ticket of their tenant. They **pick up** a ticket (which **locks** it), then
+  *Approve*, *Reject* or *Request more details*, always with a comment. Any approver of the tenant may
+  **unlock** a ticket so someone else can take it.
+* A person can belong to **several tenants** with a different role in each (switch tenant in the header).
+* **Separation of duties:** nobody can approve a ticket they raised, even if they hold both roles
+  (enforced in the domain model *and* by a database constraint).
+* The UI has two tabs: **Raise ticket** (form and your tickets) and **Approvals** (the tenant queue,
+  filtered by status, paged 10/20/50 per page). Every ticket keeps a full, timestamped history.
+
+---
 
 ## Architecture
 
 ```
-Browser ──HTTPS──► WAF (only entry point: ModSecurity + OWASP CRS, TLS, path/method allow-list)
-                     │ TLS, Kong's certificate verified
-                     ▼
-                   Kong OSS (internal only: JWT check, per-user rate limit)
-                     ├─ /        → ui (nginx, static SPA)
-                     ├─ /auth    → Keycloak (OIDC, Google sign-in)
-                     └─ /api     → ticket-service  ──mTLS──►   (re-validates JWT, tenant, role)
-                                        ├─► PostgreSQL  structured data: tenant registry, ticket workflow
-                                        │               state (status/lock/owner/version) with Row-Level Security
-                                        └─► MongoDB     ticket details (title, mobile, description) + history/comments
+                   ┌──────────────────────── Kubernetes cluster (k3s) ────────────────────────┐
+Browser ──HTTPS──► │ edge: WAF  (nginx + ModSecurity + OWASP CRS; the ONLY public entry)      │
+                   │    │ TLS, Kong's certificate verified                                    │
+                   │    ▼                                                                     │
+                   │ gateway: Kong OSS  (JWT check, per-user rate limit, size limit)          │
+                   │    ├─ /      → ui              (static SPA)                              │
+                   │    ├─ /auth  → Keycloak        (OIDC; Google sign-in)                    │
+                   │    └─ /api   ──mTLS──► ticket-service  (re-validates JWT, tenant, role,  │
+                   │                         │               per-tenant quotas)               │
+                   │                         ├─► PostgreSQL  workflow state + RLS + outbox    │
+                   │                         └─► MongoDB     ticket details + history         │
+                   │ secrets: OpenBao ──► External Secrets ──► Kubernetes Secrets             │
+                   │ observability: Prometheus · Loki · Tempo · Grafana · Alertmanager        │
+                   └──────────────────────────────────────────────────────────────────────────┘
 ```
 
 | Namespace | Contents |
-|-----------|----------|
-| `edge` | Web Application Firewall (nginx + ModSecurity v3 + OWASP CRS 4), the only public service |
-| `gateway` | Kong OSS (DB-less, declarative config) |
+|---|---|
+| `edge` | WAF (nginx + ModSecurity v3 + OWASP CRS 4), the only externally reachable service |
+| `gateway` | Kong OSS (DB-less, declarative configuration) |
 | `auth` | Keycloak |
-| `ticketing` | ticket-service, ui, PostgreSQL, MongoDB (each with a backup sidecar) |
-| `secrets` | OpenBao (secrets manager; holds every database and admin credential) |
-| `external-secrets` | External Secrets Operator (copies credentials from OpenBao into Kubernetes Secrets) |
-| `observability` | Prometheus, Alertmanager, Loki (logs + local SIEM rules), Tempo (traces), Grafana, Alloy |
+| `ticketing` | ticket-service, ui, PostgreSQL, MongoDB (each database with a backup sidecar) |
+| `secrets` / `external-secrets` | OpenBao (secrets manager) and the External Secrets Operator |
+| `observability` | Prometheus, Alertmanager, Loki (logs + SIEM rules), Tempo (traces), Grafana, Alloy |
 
-### Why two databases
-* **PostgreSQL** holds the *structured, transactional* data: the tenant registry, each ticket's workflow row
-  (status, lock holder, owner, optimistic-lock version) and Keycloak's own database. The lock/approval rules
-  need atomic, constrained updates, which fits a relational store (and its Row-Level Security).
-* **MongoDB** holds the *flexible ticket content*: details and the embedded history/comments.
-* They are separate stores, so there is no cross-database transaction. Every workflow change writes an event
-  to the **`ticket_outbox`** table in the *same* PostgreSQL transaction; the event is then projected into
-  MongoDB idempotently (immediately, and by a relay every 5 s that retries failures). A lost MongoDB write is
-  repaired automatically, and a growing backlog or a dead event raises an alert.
+Detailed walkthrough: [docs/04-architecture.md](docs/04-architecture.md).
 
-## Security model
+### Key design decisions
+
+| Decision | Why | Trade-off accepted |
+|---|---|---|
+| Shared database, tenant per row, **forced row-level security** | lowest cost per tenant; PostgreSQL itself refuses cross-tenant reads even if application code is wrong | noisy neighbours, mitigated with quotas and timeouts; premium tenants could move to separate databases later |
+| PostgreSQL for workflow + MongoDB for documents, joined by a **transactional outbox** | atomic, constrained state changes in SQL; flexible ticket content and history as documents | two stores to operate; MongoDB is eventually consistent (milliseconds); [ADR-style discussion in the interview pack](interview/01-Architecture.md) |
+| **Zero Trust**: the service re-checks the JWT and requires mTLS from Kong | a compromised or misconfigured gateway cannot impersonate users or skip checks | more certificates to manage (automated by cert-manager) |
+| **Java modules (JPMS)** around the domain | the REST layer cannot compile against repositories, so it cannot bypass tenant or role checks | enforced at compile time only (Spring Boot runs on the classpath) |
+| **WAF in front of Kong** (positive model: allowed paths, methods, content types) | scanners and generic attacks stop before the gateway; maps to AWS WAF ([docs/09](docs/09-waf-firewall.md)) | false positives must be tuned and documented |
+| **Single instances + point-in-time backups** locally | keeps the full stack within ~4.2 GB on a laptop | no high availability locally; production uses managed Multi-AZ databases |
+
+### Security model
 
 | Requirement | How it is met |
 |---|---|
-| Strict tenant isolation | Four layers: (1) tenant taken only from the validated JWT (`groups` claim) and the `X-Tenant-ID` selector is honoured only if the token proves membership; (2) Hibernate `@TenantId` filters every Postgres query; (3) Postgres **Row-Level Security** (`FORCE`d, fail-closed when no tenant is bound); (4) every MongoDB query is constrained by `tenantId`, in the only class allowed to touch the collection |
-| Java *Module* security (JPMS) | Three named modules with `module-info.java`: `com.ticketing.security` (pure Java), `com.ticketing.core` (exports **only** `TicketService` and its DTOs; the entity, repositories and Mongo store are in a non-exported package) and `com.ticketing.api`. The REST layer **cannot compile** against the persistence classes, so it cannot bypass tenant/role checks. Method security (`@PreAuthorize`) adds role checks per tenant |
-| Zero Trust | No implicit trust from network position. Browser→WAF: TLS, attack filtering (OWASP CRS) and an allow-list of paths/methods. WAF→Kong: TLS with certificate verification; only the WAF may reach Kong. Kong: JWT verified. Kong→service: **mTLS** (cert-manager CA, client cert `CN=kong-gateway`) *and* the service re-verifies the JWT, resolves tenant/role and pins the caller identity (only `kong-gateway`). Service→Keycloak: TLS with the cluster CA |
-| Pod ingress/egress rules | Default-deny ingress **and** egress in all four namespaces plus explicit allows only (see `k8s/70-network-policies.yaml`). Pods: non-root, dropped capabilities, no service-account token, read-only root FS for the service |
-| OAuth 2.0 / OIDC / JWT | Keycloak realm `ticketing`, SPA client with Authorization Code + **PKCE**; RS256 access tokens. The service accepts only **access** tokens (`typ=Bearer`) issued to the UI client (`azp=ticketing-ui`): ID tokens and tokens of other realm clients are refused |
-| RBAC | Roles per tenant from Keycloak groups: `/<tenant>/applicant`, `/<tenant>/approver`; approvers cannot act on their own tickets (separation of duties, also a DB `CHECK`) |
-| Rate limiting | Kong limits `/api` **per user** (the JWT `sub` claim), 300 requests/minute. Every Keycloak token maps to one Kong consumer, so the default per-consumer limit would be a single quota for everybody; a `pre-function` copies the `sub` claim into a gateway-owned header that `rate-limiting` keys on. It runs before `jwt`, but `rate-limiting` runs after it, so only verified tokens are counted, and a client-sent copy of that header is always replaced |
-| Browser hardening | The UI is served with a strict Content-Security-Policy (no inline script/style), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer` (`ui/default.conf`) |
-| Kong OSS | No OIDC plugin in OSS, so the OSS `jwt` plugin verifies signature and expiry with the realm's public key (rendered by `scripts/render-kong.sh`) |
+| Tenant isolation | Four layers: tenant only from the validated token (`X-Tenant-ID` merely *selects* one the token proves); Hibernate `@TenantId`; PostgreSQL row-level security, **forced** and fail-closed; every MongoDB query filtered by tenant in the one class allowed to touch it |
+| Authentication | Keycloak, Authorization Code + **PKCE** (S256), 5-minute RS256 access tokens; the service accepts only access tokens (`typ=Bearer`) issued to the UI client (`azp`) |
+| Authorization | per-tenant roles from Keycloak groups `/<tenant>/applicant` and `/<tenant>/approver`; `@PreAuthorize` method security; separation of duties also as a database `CHECK` |
+| Service-to-service | WAF→Kong TLS with verification; Kong→service **mTLS**, client certificate pinned to `CN=kong-gateway`; service→Keycloak TLS; all certificates from a cert-manager private CA |
+| Network | default-deny ingress **and** egress NetworkPolicies in every namespace, explicit allows only |
+| Workloads | non-root, all capabilities dropped, no service-account tokens, read-only root filesystem where possible, images pinned |
+| Abuse limits | WAF (OWASP CRS, 1 MB bodies); Kong 300 requests/min **per user** (JWT `sub`); service per-tenant requests/min and concurrency quotas; 5 s SQL statement timeout |
+| Admin plane | Keycloak admin console and `master` realm blocked publicly (WAF + Kong, 403); reachable only through `kubectl port-forward` |
+| Secrets | OpenBao + External Secrets, one store per namespace, random rotated credentials; nothing sensitive in Git |
+| Detection | Kubernetes API audit, Keycloak events, WAF audit log → Loki with alert rules (admin brute force, credential stuffing, privilege change, untrusted workload identity, secret reads, exec) |
 
-## Prerequisites (Windows: run the scripts from Git Bash or WSL)
+Full control catalogue and remaining gaps: [docs/08-security-zero-trust.md](docs/08-security-zero-trust.md).
 
-Docker Desktop, [k3d](https://k3d.io), `kubectl`, JDK 21, Maven 3.9+. Internet access is needed to pull images and
-Maven dependencies. The hostname `ticketing.localtest.me` resolves to 127.0.0.1 via public DNS.
+### Operations features
 
-## Run
+| Concern | Implementation | Entry point |
+|---|---|---|
+| Consistency | transactional outbox, idempotent projection, 5 s relay with retries, backlog and dead-event alerts | `ticket-core/.../OutboxPublisher.java` |
+| Backups / PITR | PostgreSQL WAL archiving + daily base backup; MongoDB replica set + full dump + 5-minute oplog slices; RPO ≤ 5 min | `scripts/restore-drill.sh` |
+| Observability | RED metrics, logs, distributed traces (Kong + service), correlation ID end to end, SLO burn-rate alerts, dead-man's switch | `scripts/verify-observability.sh` |
+| Secrets | OpenBao (Raft, TLS, audit device) → External Secrets; one-command rotation | `scripts/secrets-bootstrap.sh --rotate` |
+| CI/CD | build + tests (no skips), Trivy gate, SBOM, cosign keyless signing, k3d e2e job; release with a protected environment and digest-pinned deploy | `.github/workflows/` |
+
+---
+
+## Getting started
+
+### 1. Prerequisites
+
+| Tool | Version used | Install |
+|---|---|---|
+| Docker Desktop (or Docker Engine on Linux) | 29.x | https://docs.docker.com/get-docker/ |
+| k3d (runs k3s inside Docker) | 5.9 | Windows `choco install k3d`, macOS `brew install k3d`, Linux `curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh \| bash` |
+| kubectl | 1.33+ | Windows `winget install -e --id Kubernetes.kubectl`, macOS `brew install kubectl`, Linux: https://kubernetes.io/docs/tasks/tools/ |
+| JDK | 21 | Windows `winget install -e --id EclipseAdoptium.Temurin.21.JDK`, macOS `brew install openjdk@21`, Linux: your package manager |
+| openssl, bash, curl | any recent | included with Git for Windows (Git Bash), macOS and Linux |
+
+Maven is **not** needed: the repository includes the Maven wrapper (`./mvnw`, Maven 3.9.16).
+
+**Machine:** give Docker at least **4 CPUs and 8 GB of memory** (Docker Desktop → Settings → Resources).
+The full stack uses about 4.2 GB. **Windows:** run every command from **Git Bash** (or WSL), not
+PowerShell or cmd.
+
+### 2. Get the code
 
 ```bash
-./mvnw verify                         # compiles the three modules, runs the 43 tests (fails if any is skipped)
-bash scripts/up.sh                    # cluster + audit + images + cert-manager + OpenBao + everything; a few minutes
-bash scripts/e2e.sh                   # 56 end-to-end checks (WAF, mTLS, NetworkPolicy, admin lockdown, workflow)
-bash scripts/verify-observability.sh  # 15 checks: metrics, logs, traces, alert rules, a simulated attack alert
-bash scripts/restore-drill.sh all     # point-in-time restore of PostgreSQL and MongoDB into throwaway pods
-bash scripts/load-test.sh             # k6 load test (runs in Docker)
-bash scripts/down.sh                  # delete the cluster
+git clone https://github.com/ravik775/ticketing.git
+cd ticketing
 ```
 
-Open **https://ticketing.localtest.me:8443** (self-signed certificate: accept the browser warning).
+### 3. Create the k3s cluster and deploy everything
+
+One command builds the code, creates the cluster and deploys the whole platform. It is safe to re-run.
+The first run takes about 5–10 minutes (mostly image downloads).
+
+```bash
+bash scripts/up.sh
+```
+
+What `up.sh` does, step by step:
+
+| Step | What happens |
+|---|---|
+| 1. Cluster | `k3d cluster create ticketing --servers 1 --agents 0 --api-port 127.0.0.1:6550 -p "8443:443@loadbalancer" --k3s-arg "--disable=traefik@server:0"`: a one-node **k3s** cluster in Docker; host port 8443 goes to the cluster's load balancer; the built-in Traefik ingress is disabled so the WAF is the only way in |
+| 2. Audit | enables Kubernetes API audit logging on the k3s server (`scripts/enable-k8s-audit.sh`) |
+| 3. Build | `./mvnw package`, then builds the `ticket-service` and `ui` images and imports them into the cluster (`k3d image import`) |
+| 4. cert-manager | installs cert-manager, which issues every internal certificate from a private CA |
+| 5. Secrets | installs the External Secrets Operator and OpenBao, then generates random credentials (`scripts/secrets-bootstrap.sh`). The OpenBao root token is saved **outside** the repository in `~/.ticketing/openbao-init.json` |
+| 6. Platform | `kubectl apply -k k8s`: databases, Keycloak (with the demo realm), the service, UI, Kong, WAF, NetworkPolicies and the observability stack |
+| 7. Gateway | renders Kong's declarative configuration with Keycloak's signing key and its client certificate (`scripts/render-kong.sh`) |
+| 8. Audit events | turns on Keycloak login and admin events (`scripts/configure-keycloak-audit.sh`) |
+
+### 4. Verify the deployment
+
+```bash
+kubectl get pods -A                     # everything Running / Completed
+bash scripts/e2e.sh                     # 56 checks: WAF, TLS/mTLS, NetworkPolicies, admin lockdown, full workflow
+bash scripts/verify-observability.sh    # 15 checks: metrics, logs, traces, alert rules, a simulated attack alert
+```
+
+### 5. Open the application
+
+**https://ticketing.localtest.me:8443**. The certificate comes from the cluster's private CA, so
+accept the browser warning. (`*.localtest.me` is a public DNS name that points at `127.0.0.1`; no hosts
+file edit is needed.)
 
 | User | Password | Role |
 |---|---|---|
-| alice | `Passw0rd!` (demo end users only; database and admin passwords are random, see below) | applicant in **acme** *and* **globex** |
+| alice | `Passw0rd!` | applicant in **acme** *and* **globex** |
 | erin | `Passw0rd!` | applicant in acme |
 | bob, carol | `Passw0rd!` | approvers in acme |
 | dave | `Passw0rd!` | approver in globex |
 
-Grafana: `kubectl -n observability port-forward svc/grafana 3000:3000` → http://localhost:3000 (user `admin`,
-password in Secret `observability/grafana-admin`): dashboards, alerts and traces.
+These demo end-user passwords exist for testing only. Database, Keycloak admin and Grafana passwords are
+random and live in OpenBao.
 
-Try: sign in as alice, raise a ticket in acme → sign in as bob (private window), pick it up → carol cannot
-pick it up or decide → carol unlocks it, picks it up and approves → alice sees the outcome and comments.
+**Try the workflow:** sign in as alice and raise a ticket in acme → in a private window sign in as bob and
+pick it up → carol cannot act on it → carol unlocks it, picks it up and approves → alice sees the outcome.
 
-### REST API (all under `/api`, `Authorization: Bearer <jwt>`, `X-Tenant-ID: <tenant>` if you belong to several)
+### 6. Admin tools (internal only, through a tunnel)
 
-| Method & path | Who | Purpose |
+| Tool | Command | Then open |
 |---|---|---|
-| `GET /me` | any user | email and tenants/roles proven by the token |
-| `POST /tickets` | applicant | raise a ticket `{title, mobile, description}` |
-| `GET /tickets?page=&size=`, `GET /tickets/{id}` | applicant | own tickets only (others → 404); paged, `size` 1–200 (default 50) |
-| `POST /tickets/{id}/respond` | applicant | answer a "more details" request |
-| `GET /approvals/tickets?status=&page=&size=`, `GET /approvals/tickets/{id}` | approver | all tickets of the tenant; paged like above |
-| `POST /approvals/tickets/{id}/claim` | approver | pick up / lock (409 if locked, 403 on your own ticket) |
-| `POST /approvals/tickets/{id}/unlock` | approver | release a lock, including another approver's (403 on your own ticket) |
-| `POST /approvals/tickets/{id}/decision` | approver | `{decision: APPROVE\|REJECT\|REQUEST_INFO, comment}`; only the lock holder |
+| Keycloak admin console | `kubectl -n auth port-forward svc/keycloak 9443:8443` | https://localhost:9443/auth/admin/ (user `admin`) |
+| Grafana | `kubectl -n observability port-forward svc/grafana 3000:3000` | http://localhost:3000 (user `admin`) |
+| Prometheus alerts | `kubectl -n observability port-forward svc/prometheus 9090:9090` | http://localhost:9090/alerts |
 
-Locks do not expire by default. Set `TICKET_LOCK_TIMEOUT` (ISO-8601, e.g. `PT30M`) on the ticket-service to let
-another approver take over a lock older than that; the takeover is recorded in the ticket history.
+Passwords:
+```bash
+kubectl -n auth get secret keycloak-env -o jsonpath="{.data.KC_BOOTSTRAP_ADMIN_PASSWORD}" | base64 -d; echo
+kubectl -n observability get secret grafana-admin -o jsonpath="{.data.password}" | base64 -d; echo
+```
 
-## Google sign-in
+### 7. Optional: sign in with Google
 
 Create a *Web* OAuth client in Google Cloud with redirect URI
 `https://ticketing.localtest.me:8443/auth/realms/ticketing/broker/google/endpoint`, then:
 
 ```bash
-scripts/set-google.sh <client-id> <client-secret>
+bash scripts/set-google.sh <client-id> <client-secret>
+bash scripts/add-role.sh <gmail-address> acme applicant     # after the person has signed in once
 ```
 
-Keycloak's NetworkPolicy allows outbound HTTPS to public addresses for this (the code exchange with Google is
-server-side); private and cluster ranges stay blocked.
+### 8. Stop or remove
 
-Google users start with **no tenant** and get a clear message in the UI until an administrator adds them to a
-group (e.g. `/acme/applicant`), with `bash scripts/add-role.sh <email> <tenant> <role>` or in the Keycloak admin
-console. The console is blocked on the public address (403); open it through a tunnel:
-`kubectl -n auth port-forward svc/keycloak 9443:8443` → https://localhost:9443/auth/admin/ (user `admin`; password:
-`kubectl -n auth get secret keycloak-env -o jsonpath="{.data.KC_BOOTSTRAP_ADMIN_PASSWORD}" | base64 -d`).
+```bash
+k3d cluster stop ticketing      # pause (keeps data);  k3d cluster start ticketing  to resume
+bash scripts/down.sh            # delete the cluster and its data
+```
 
-## Secrets, backups, observability and CI/CD
+### Using native k3s instead of k3d (Linux, manual)
 
-| Concern | Implementation | Main script / file |
+The scripts target k3d. On a Linux machine with k3s installed natively, the same manifests apply; only
+the cluster and image steps differ:
+
+```bash
+curl -sfL https://get.k3s.io | sh -s - --disable=traefik          # k3s without Traefik
+export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+docker save ticketing/ticket-service:dev ticketing/ui:dev | sudo k3s ctr images import -
+```
+
+Then run steps 4–8 of `up.sh` by hand. The WAF's LoadBalancer service is published on port **443** of
+the host (k3s ServiceLB), so use `https://ticketing.localtest.me/`. This path is documented but not
+exercised by the scripts or CI.
+
+---
+
+## Day-to-day commands
+
+| Task | Command |
+|---|---|
+| Build and run all tests | `./mvnw verify` (needs Docker for Testcontainers; fails if any test is skipped) |
+| Redeploy after a code change | `bash scripts/up.sh` (idempotent) |
+| Give a user a role | `bash scripts/add-role.sh <email-or-username> <tenant> <applicant\|approver>` |
+| Rotate every credential | `bash scripts/secrets-bootstrap.sh --rotate` |
+| Point-in-time restore drill | `bash scripts/restore-drill.sh all` or `... postgres "2026-10-05 08:15:00"` |
+| Load test (k6 in Docker) | `bash scripts/load-test.sh` |
+| Reload renewed certificates | `bash scripts/reload-certs.sh` |
+| Follow the WAF log | `kubectl -n edge logs deploy/waf -f` |
+
+Step-by-step guides for maintainers (users and roles, logs, databases, certificates, OpenSSL, AWS,
+security, WAF) are in the **[operations handbook](docs/README.md)**.
+
+---
+
+## REST API
+
+All endpoints are under `/api` and need `Authorization: Bearer <access token>`; add `X-Tenant-ID: <tenant>`
+if you belong to several tenants.
+
+| Method and path | Who | Purpose |
 |---|---|---|
-| Secrets | OpenBao (Raft, TLS, audit device) → External Secrets Operator, one store per namespace; no passwords in Git. The OpenBao root token is kept outside the repository in `~/.ticketing/openbao-init.json` | `scripts/secrets-bootstrap.sh` (`--rotate` changes every credential and restarts consumers) |
-| Backups / PITR | PostgreSQL WAL archiving + daily base backup; MongoDB 1-member replica set + full dump + 5-minute oplog slices; one backup copy each | `scripts/restore-drill.sh` |
-| Observability | Metrics (Prometheus), logs (Loki), traces (Tempo, from Kong and the service), Grafana dashboard, SLO burn-rate alerts, `Watchdog` | `k8s/90-observability.yaml`, `scripts/verify-observability.sh` |
-| Audit | Kubernetes API audit, Keycloak user/admin events, WAF audit log, all in Loki with detection rules | `scripts/enable-k8s-audit.sh`, `scripts/configure-keycloak-audit.sh` |
-| Tenant fairness | Per-tenant requests/minute and concurrency quotas (429), 5 s statement timeout, daily usage metering | `tenant` / `tenant_usage` tables |
-| CI/CD | GitHub Actions: build + tests (no skips), Trivy, SBOM, cosign signing, k3d end-to-end; release workflow with a protected environment | `.github/workflows/` |
+| `GET /me` | any user | email and the tenants/roles proven by the token |
+| `POST /tickets` | applicant | raise a ticket `{title, mobile, description}` |
+| `GET /tickets?page=&size=`, `GET /tickets/{id}` | applicant | own tickets only (others → 404); `size` 1–200 |
+| `POST /tickets/{id}/respond` | applicant | answer a "more details" request |
+| `GET /approvals/tickets?status=&page=&size=`, `GET /approvals/tickets/{id}` | approver | all tickets of the tenant |
+| `POST /approvals/tickets/{id}/claim` | approver | pick up and lock (409 if locked, 403 on your own ticket) |
+| `POST /approvals/tickets/{id}/unlock` | approver | release a lock (403 on your own ticket) |
+| `POST /approvals/tickets/{id}/decision` | approver | `{decision: APPROVE\|REJECT\|REQUEST_INFO, comment}`; lock holder only |
 
-Enterprise readiness and the remaining gaps: [docs/enterprise-gap.md](docs/enterprise-gap.md).
+Errors use RFC 7807 problem details. Over-quota tenants receive **429** with `Retry-After`. Locks do not
+expire by default; set `TICKET_LOCK_TIMEOUT` (e.g. `PT30M`) to allow takeover of old locks (recorded in
+the history).
+
+---
+
+## Testing and quality
+
+| Level | What | How |
+|---|---|---|
+| Unit and slice | domain rules, security filters, tenant resolution, quotas | `./mvnw verify` |
+| Integration | real PostgreSQL and MongoDB (Testcontainers): row-level security, outbox recovery, full workflow | `./mvnw verify` |
+| End to end | 56 checks against the running cluster through the WAF: attacks blocked, mTLS enforced, NetworkPolicies, admin lockdown, cross-tenant access refused, the approval workflow | `scripts/e2e.sh` |
+| Operability | metrics, logs, traces, alert rules, a simulated attack that must raise an alert | `scripts/verify-observability.sh` |
+| Recovery | restore to a point in time in throw-away pods | `scripts/restore-drill.sh` |
+| Performance | k6, 20 users: 36.6 req/s, p50 36 ms, p95 109 ms, 0 % errors | `scripts/load-test.sh` |
+| Supply chain | Trivy (fails on fixable critical/high), SBOM, cosign signatures, pinned actions, Dependabot | GitHub Actions |
+
+---
 
 ## Repository layout
 
 ```
-pom.xml                    parent (Spring Boot 3.5, Java 21)
-ticket-security/           tenant context + role/tenant resolution (pure Java module)
-ticket-core/               TicketService facade (exported); entity, Postgres + Mongo stores (not exported); Flyway SQL
-ticket-api/                REST controllers, Spring Security (JWT, mTLS identity, tenant filter), Dockerfile
-ui/                        static SPA (PKCE login, applicant and approver views) + Dockerfile
-docs/                      operations handbook for maintainers (start at docs/README.md)
-k8s/                       kustomize: namespaces, PKI, OpenBao, External Secrets, Postgres, MongoDB, Keycloak (+realm), service, ui, Kong, NetworkPolicies, WAF, observability
-scripts/                   up/down, render-kong, e2e, secrets-bootstrap, restore-drill, verify-observability, load-test, set-google, add-role, reload-certs
-.github/workflows/         ci.yml (build, scan, e2e, images), release.yml (signed release, gated deploy)
-interview/                 interview question bank built on this system
+pom.xml                 parent build (Spring Boot 3.5, Java 21), Maven wrapper in mvnw / .mvn
+ticket-security/        tenant context and role resolution (pure Java module)
+ticket-core/            TicketService facade (exported); persistence, outbox, quotas (not exported); Flyway SQL
+ticket-api/             REST controllers, Spring Security (JWT, mTLS identity, tenant filter, quotas), Dockerfile
+ui/                     single-page app (PKCE login, tabs for raising and approving) + nginx Dockerfile
+k8s/                    Kustomize manifests: namespaces, PKI, OpenBao, External Secrets, databases, Keycloak,
+                        service, UI, Kong, WAF, NetworkPolicies, observability
+scripts/                up/down, e2e, render-kong, secrets-bootstrap, restore-drill, verify-observability,
+                        load-test, set-google, add-role, reload-certs
+load/                   k6 load-test scenario
+.github/                CI (build, scan, e2e, images), release (signed, gated deploy), Dependabot
+docs/                   operations handbook, AWS deployment, security, WAF, enterprise gap assessment
+interview/              architecture interview question bank built on this system
 ```
 
-## Known limits (deliberate, to keep the demo small)
+---
 
-* **Demo end users** (`Passw0rd!`) come from the realm import, and the Keycloak client allows the password grant
-  only so `e2e.sh` can fetch tokens with curl. Remove both for anything real.
-* PostgreSQL and MongoDB traffic is plain inside the cluster and protected by NetworkPolicies only (add TLS or a
-  service mesh next). The UI is served over plain HTTP between Kong and the nginx pod.
-* JPMS is enforced at **compile time**: Spring Boot runs the fat jar on the classpath, so the boundary is not
-  re-enforced by the JVM at runtime.
-* Kong holds a single JWT verification key read from Keycloak at deploy time; re-run `scripts/render-kong.sh`
-  if the realm's signing key changes. The cert-manager certificates are valid 90 days (CA 10 years).
-* Single replicas by decision (to save laptop resources): PostgreSQL and MongoDB are protected by point-in-time
-  backups rather than replicas, and the one backup copy sits on the same node. Health probes use a separate
-  plain-HTTP management port (9090) that only the kubelet and Prometheus can reach.
-* Rate-limit counters are local to each Kong pod (`policy: local`); with several Kong replicas use the
-  `redis` policy so a user's quota is shared.
-* The UI renews its 5-minute access token with the refresh token (kept in memory only). If the SSO session
-  has ended, unsent form text is kept in `sessionStorage` across the sign-in redirect and restored.
+## From laptop to production
+
+The local cluster deliberately narrows some concerns to fit on a laptop; each has a documented
+production design.
+
+| Concern | Local (this repository) | Production (AWS design, [docs/07](docs/07-aws-deployment.md)) |
+|---|---|---|
+| Entry and WAF | WAF pod on `localhost:8443`, private CA | Route 53 → ALB with ACM certificate + AWS WAF, in-cluster WAF as a second layer |
+| Compute | one k3s node, one replica each | EKS across 3 availability zones, 2+ replicas, autoscaling |
+| Databases | single PostgreSQL and MongoDB with PITR backups on the same node | RDS PostgreSQL Multi-AZ, managed document store, cross-account backups |
+| Secrets | OpenBao in the cluster | AWS Secrets Manager / KMS via External Secrets |
+| Rate-limit counters | per Kong pod | shared store (Redis / ElastiCache) |
+| Observability | self-hosted Prometheus, Loki, Tempo, Grafana | managed equivalents, paging to on-call |
+
+**Known limits:** demo end-user passwords and the password grant exist for testing only; database
+connections inside the cluster are not encrypted; Kong holds one JWT verification key (re-render after
+Keycloak key rotation); JPMS is enforced at compile time. The enterprise readiness scorecard
+(3.8 → about 6.2 out of 10) and the ranked list of open gaps are in
+[docs/enterprise-gap.md](docs/enterprise-gap.md).

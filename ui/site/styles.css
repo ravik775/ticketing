@@ -30,3 +30,14 @@ button.warn { background:var(--warn); border-color:var(--warn); }
 #error.show { display:block; }
 #welcome { text-align:center; padding:60px 16px; } #welcome .row { justify-content:center; }
 [hidden] { display:none !important; }
+.tabs { display:flex; gap:4px; border-bottom:1px solid var(--line); margin-bottom:-8px; }
+.tab { background:transparent; color:var(--muted); border:1px solid transparent; border-bottom:none;
+       border-radius:8px 8px 0 0; margin-bottom:-1px; padding:8px 16px; }
+.tab[aria-selected="true"] { background:var(--card); color:var(--ink); border-color:var(--line); font-weight:600; }
+.tab:focus-visible { outline:2px solid var(--brand); outline-offset:-2px; }
+.panel { display:grid; gap:20px; }
+.pager { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-top:12px;
+         padding-top:12px; border-top:1px solid var(--line); }
+.pager.top { padding-top:0; border-top:none; }
+.pager select { width:auto; }
+button:disabled { opacity:.45; cursor:not-allowed; }
