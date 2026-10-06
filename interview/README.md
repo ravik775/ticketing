@@ -18,7 +18,7 @@ approval**; interviewers expect you to separate "what runs today" from "what I w
 | 02 | [Multi-Tenancy](02-Multi-Tenancy.md) | noisy neighbours, month-end peaks, isolation vs shared DB cost/performance, tiers, cells |
 | 03 | [Consistency & Replication](03-Consistency-and-Replication.md) | **PACELC, PostgreSQL & MongoDB replication lag** (with a validated lab), read-your-writes, failover |
 | 04 | [Data](04-Data.md) | RLS internals, dual write, outbox, erasure, backups |
-| 05 | [Security](05-Security.md) | Zero Trust (NIST 800-207), mTLS/PKI, STRIDE, OWASP API Top 10, supply chain |
+| 05 | [Security](05-Security.md) | Zero Trust (NIST 800-207), mTLS/PKI, workload identity (SPIFFE/SPIRE), STRIDE, OWASP API Top 10, supply chain |
 | 06 | [WAF](06-WAF.md) | ModSecurity + OWASP CRS, positive model, tuning |
 | 07 | [Kong](07-Kong.md) | gateway, per-user limits, key rotation, upstream mTLS |
 | 08 | [Keycloak](08-Keycloak.md) | OAuth 2.0/OIDC, PKCE, tokens, brokering, revocation |

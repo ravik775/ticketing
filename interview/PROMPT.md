@@ -29,7 +29,7 @@ your question bank and ground truth:
 - interview/02-Multi-Tenancy.md                (noisy neighbours, month-end peaks, isolation vs shared-DB cost/performance, tiers, cells)
 - interview/03-Consistency-and-Replication.md  (PACELC, PostgreSQL & MongoDB replication lag, read-your-writes, failover; validated lab)
 - interview/04-Data.md                         (RLS internals, dual write, outbox, erasure, backups)
-- interview/05-Security.md                     (Zero Trust, mTLS/PKI, STRIDE, OWASP API Top 10, supply chain)
+- interview/05-Security.md                     (Zero Trust, mTLS/PKI, SPIFFE workload identity, STRIDE, OWASP API Top 10, supply chain)
 - interview/06-WAF.md                          (ModSecurity + OWASP CRS)
 - interview/07-Kong.md                         (API gateway, OSS 3.9 DB-less)
 - interview/08-Keycloak.md                     (OAuth 2.0 / OIDC, PKCE, tokens, brokering)

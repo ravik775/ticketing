@@ -8,6 +8,16 @@
 * **mTLS & PKI:** handshake (ClientHello → server cert → CertificateRequest → client cert →
   CertificateVerify), chain validation (signature, validity, basic constraints, key usage/EKU, name via
   **SAN**, not CN, for servers), revocation (CRL/OCSP) vs short-lived certificates, key rotation.
+* **Workload identity: SPIFFE / SPIRE:** SPIFFE (Secure Production Identity Framework For Everyone,
+  a CNCF graduated standard) defines *who a workload is*, independent of its IP or network:
+  a **SPIFFE ID** URI (`spiffe://<trust-domain>/<path>`, e.g. `spiffe://prod.example/ns/gateway/sa/kong`),
+  carried in an **SVID** (SPIFFE Verifiable Identity Document: an X.509 certificate with the ID as a
+  URI SAN, or a JWT), a **trust bundle** per trust domain (the CA certificates to verify SVIDs), and the
+  **Workload API** (a local socket from which a workload fetches its SVID and bundle; no secret is ever
+  pre-placed). **SPIRE** is the reference implementation: a server (signing authority) plus an agent
+  on every node that **attests** the node (e.g. AWS instance identity) and the workload (Kubernetes
+  namespace, service account, image) before issuing a short-lived SVID (typically 1 hour), rotated
+  automatically. Istio, Linkerd, Consul and AWS/GCP meshes issue SPIFFE-format identities too.
 * **Threat modelling:** STRIDE (Spoofing, Tampering, Repudiation, Information disclosure, Denial of
   service, Elevation of privilege) per data flow and trust boundary.
 * **OWASP API Security Top 10 (2023):** API1 BOLA, API2 broken authentication, API3 property-level
@@ -51,6 +61,7 @@
 | Q9 | Accepted gaps | closed locally: OpenBao + External Secrets; admin console blocked at WAF + Kong | AWS Secrets Manager/KMS; internal ALB or VPN for admin | pipeline secret scan; external scan shows no `/auth/admin` |
 | Q10 | Security monitoring | logs only | SIEM with detections (see 14-Audit-and-Alerting) | detection tests (purple team) |
 | Q11 | PII to approvers | full mobile/email shown | purpose-documented, masked lists, reveal on demand | DPIA, RoPA entry |
+| Q12 | SPIFFE / SPIRE | not used: one mTLS hop, cert-manager certificates, CN pinned, NetworkPolicy limits who can connect | adopt when triggers appear (many services, multi-cluster/hybrid, short-lived certs, mesh): SPIRE or a mesh issuing SPIFFE IDs, authorisation on SPIFFE ID | SVID lifetime ≤ 1 h observed; a pod with the wrong service account cannot obtain the Kong identity |
 
 ## Prove it
 
@@ -177,7 +188,61 @@ contact data to process tickets (business purpose). Verify purpose with the data
 the RoPA, mask in lists and reveal on demand if possible, and ensure logs don't contain it. Answering
 with purpose limitation shows privacy-by-design thinking.
 
-### Q12. Rapid fire
+### Q12. What is SPIFFE, and why doesn't this system use it? ★★★★★
+**30-second headline:** SPIFFE is a standard for workload identity: every service gets a short-lived, automatically rotated, attested certificate whose URI names *what it is*, not where it runs. Here only one hop needs a workload identity (Kong → ticket-service), and cert-manager + CN pinning + NetworkPolicy cover it at a fraction of the operational cost. I'd adopt it when the number of services, clusters or the need for short-lived certificates makes certificate management by hand the bigger risk.
+**Weak answer (what fails):** "SPIFFE is a service mesh" (it is an identity standard; meshes *use* it), or "we don't need it because we have mTLS" (mTLS is the transport; SPIFFE answers *who* is on the other end and *how they proved it*).
+**Strong answer:**
+*What it is.* A SPIFFE ID (`spiffe://trust-domain/ns/gateway/sa/kong`) is issued inside an SVID (X.509
+certificate with the ID as URI SAN, or a JWT). SPIRE agents **attest** the node and the workload
+(namespace, service account, image digest) before handing out an SVID over the local Workload API;
+SVIDs live about an hour and rotate without restarts. Authorisation then checks the SPIFFE ID, and
+federation lets two trust domains (two clusters, cloud + on-prem) trust each other's identities.
+
+*What this system does instead (same intent, smaller scale).*
+* One workload-to-workload trust decision that matters: **Kong → ticket-service**. Kong presents a
+  cert-manager certificate (`CN=kong-gateway`, EKU clientAuth); the service accepts only that identity
+  (Q3) **and** still re-validates the user's JWT.
+* NetworkPolicy allows only the gateway namespace to reach the service, so a stolen certificate is
+  useless from anywhere else.
+* Every other hop is server-authenticated TLS (WAF→Kong, service→Keycloak, External Secrets→OpenBao),
+  where identity is the hostname in the SAN.
+
+*Why it is not needed here (the decision).*
+| Factor | This system | When SPIFFE pays off |
+|---|---|---|
+| Services needing caller identity | 1 caller (Kong), 1 callee | tens to hundreds of services calling each other |
+| Clusters / environments | one cluster, one trust domain | multi-cluster, hybrid, multi-cloud (federation) |
+| Certificate lifetime | 90 days, renewed at 60, reload by script | hours; impossible to manage without automatic rotation |
+| Bootstrap secret problem | certificates are Kubernetes Secrets in the right namespace | workloads on VMs, serverless, outside Kubernetes |
+| Operating cost | cert-manager already present | SPIRE server (HA, its own CA and datastore) + an agent per node, or a full mesh |
+On a laptop with one replica each, SPIRE (server + agent) or a mesh would add CPU, memory and moving
+parts to protect one connection that is already mutually authenticated, identity-pinned and
+network-restricted. That is cost without matching risk reduction.
+
+*Honest limits of the current approach (what SPIFFE would fix).*
+* **Any namespace may request a `kong-gateway` certificate** from the cluster-wide issuer (documented
+  gap in `docs/08`). SPIRE issues an identity only after attesting namespace + service account, so a
+  rogue pod could not obtain Kong's identity. A cheaper fix within cert-manager: a namespaced Issuer or
+  approver-policy.
+* **No revocation, long-lived certificates** (Q4). SVIDs expire within the hour.
+* **CN pinning** is weaker than a URI SAN; moving to `spiffe://`-style URI SANs in cert-manager
+  certificates is a free step towards SPIFFE without SPIRE.
+
+*Production path.* Start with URI SANs in SPIFFE format via cert-manager (or the cert-manager
+`csi-driver-spiffe`, which issues short-lived SPIFFE SVIDs per pod); move to SPIRE or a mesh
+(Istio/Linkerd issue SPIFFE IDs) when the service count, multi-cluster federation or short-lived
+certificates become requirements. Either way it needs an architecture decision (new component,
+operating model) and is not changed in the local design.
+**Follow-ups / traps:** "Isn't the JWT enough?" (the JWT identifies the *user*; SPIFFE identifies the
+*calling workload*: Zero Trust wants both). "How does a workload get its first credential?"
+(attestation by the SPIRE agent: no pre-shared secret, which is the problem SPIFFE was built for).
+"SPIFFE vs AWS IAM roles for service accounts?" (IRSA/Pod Identity give AWS API access; SPIFFE gives
+portable service-to-service identity across clouds; they complement each other.)
+**Would I do it again?** Yes: not using SPIFFE was right for one hop; I'd still put the identity in a URI SAN from day one.
+
+### Q13. Rapid fire
+* What is a SPIFFE ID? → a URI `spiffe://trust-domain/path` naming a workload, carried in an SVID.
+* Who attests a workload in SPIRE? → the node agent (namespace, service account, image) before issuing an SVID.
 * What makes an ID token unusable at the API? → `typ` must be `Bearer`.
 * Server name validation uses CN or SAN? → SAN (CN ignored by modern TLS clients for hostnames).
 * What does `frame-ancestors 'none'` prevent? → clickjacking.
