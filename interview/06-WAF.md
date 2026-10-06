@@ -24,7 +24,7 @@
 | Concept | Implementation | Where |
 |---|---|---|
 | Single entry, terminate + re-encrypt | nginx :8443 TLS 1.2/1.3 → `proxy_pass https://kong` with `proxy_ssl_verify on`, CA, SNI name | `k8s/80-waf.yaml` (default.conf.template) |
-| Positive model | rule 1000110 path allow-list (404), 1000100 methods, 1000120 JSON-only API (415), host check (421) | `ticketing-before.conf` |
+| Positive model | rule 1000110 path allow-list (404), 1000100 admin paths internal only (403), CRS 911100 methods (GET/HEAD/POST/OPTIONS), 1000120 JSON-only API (415), host check (421) | `ticketing-before.conf` |
 | Negative model | CRS 4.30 at PL1, inbound threshold 5, outbound 4 | env vars in `80-waf.yaml` |
 | Tuned exclusion | FP-1: `ctl:ruleRemoveById=920180` only for claim/unlock | rule 1000200 |
 | Resource limits | 1 MB body, 10 s header/body timeouts, 16 KB headers | nginx directives |
@@ -83,8 +83,8 @@ sensitive endpoints.
 ### Q2. Positive security model: what did we allow-list, what does it cost, and how do you keep it from rotting? ★★★★
 **30-second headline:** Allowed: our paths, methods and JSON bodies only; cost is coupling every new route or asset to a WAF change, so generate the allow-list from the API contract and test every route in CI.
 **Weak answer (what fails):** Ignoring the maintenance cost of a positive model.
-**Strong answer:** Paths (`/`, five static files, `/api/`, `/auth`), methods (GET/HEAD/POST/OPTIONS,
-+PUT/PATCH/DELETE under `/auth/admin/`), JSON-only API bodies, host names. Cost: every new UI asset or
+**Strong answer:** Paths (`/`, five static files, `/api/`, `/auth`), methods (GET/HEAD/POST/OPTIONS only;
+the admin console and `master` realm are refused outright by rule 1000100), JSON-only API bodies, host names. Cost: every new UI asset or
 endpoint needs a WAF change: coupling between app releases and WAF config. Keep it alive by
 generating the allow-list from the API contract (OpenAPI) in CI, or by moving fine-grained positive
 validation to the gateway (request validator) where it is versioned with the API. e2e tests catch
@@ -173,6 +173,12 @@ absorb DDoS. Cloud WAF: managed rules, bot management, global edge, DDoS absorpt
 but vendor lock-in, less transparency, needs a public domain. Best for production: cloud WAF at the
 perimeter + in-cluster positive model (defence in depth). This repo chose local because there is no
 public domain (documented decision).
+**Follow-ups / traps (migration to AWS WAF):** "What changes when you translate the rules?" (CRS *scores*
+and blocks at a threshold; AWS WAF acts on the *first matching rule*, so expect different false positives:
+start every managed group in Count mode. On an ALB, AWS WAF inspects only the first 8 KB of the body and
+`SizeRestrictions_BODY` blocks larger bodies: override it to Count for `POST /api/tickets` and keep the 1 MB
+limit in Kong. `ctl:ruleRemoveById` exclusions become `rule_action_override` + scope-down statements.
+Per-user limits stay in Kong because AWS WAF cannot verify a JWT; AWS adds per-IP rate-based rules.)
 
 ### Q11. The WAF image runs with a writable root filesystem. Risk and remediation? ★★★
 **30-second headline:** The image renders config into its root filesystem at start; fix with an init container writing to emptyDir or a derived image with baked config, then make the root read-only.
