@@ -23,7 +23,8 @@ public record TicketDocument(
     /**
      * Embedded audit/comment entry. {@code eventId} is the outbox row id: it makes applying an event
      * idempotent (the relay may retry). Events written before the outbox existed have no id.
+     * {@code channel} is the path the actor used: REST or MCP (absent on older events).
      */
-    public record EventDoc(String eventId, String type, String actor, String comment, Instant at) {
+    public record EventDoc(String eventId, String type, String actor, String channel, String comment, Instant at) {
     }
 }

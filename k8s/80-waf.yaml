@@ -110,7 +110,9 @@ data:
 
     # 2. Positive model for paths: only what the application actually serves. Everything else
     #    (scanners probing /wp-admin, /.git, /actuator, /phpmyadmin ...) never reaches Kong.
-    SecRule REQUEST_FILENAME "!@rx ^/(?:$|index\.html$|app\.js$|styles\.css$|favicon\.ico$|api/|auth(?:/|$))" \
+    #    /api/ includes the MCP endpoint /api/mcp; /.well-known/oauth-protected-resource is the MCP OAuth
+    #    discovery document (answered by Kong).
+    SecRule REQUEST_FILENAME "!@rx ^/(?:$|index\.html$|app\.js$|styles\.css$|favicon\.ico$|api/|auth(?:/|$)|\.well-known/oauth-protected-resource(?:/|$))" \
         "id:1000110,phase:1,deny,status:404,log,t:none,\
         msg:'Path is not part of the application',tag:'ticketing/basic-firewall'"
 
@@ -127,6 +129,14 @@ data:
     #       which CRS rule 920180 scores (3 points). Disable that ONE rule for these TWO endpoints only.
     SecRule REQUEST_URI "@rx ^/api/approvals/tickets/[0-9a-fA-F-]{36}/(?:claim|unlock)$" \
         "id:1000200,phase:1,pass,nolog,t:none,ctl:ruleRemoveById=920180"
+
+    # FP-2: MCP clients (AI agents) sign in with a loopback redirect, e.g. redirect_uri=http://127.0.0.1:53682/callback
+    #       (RFC 8252). CRS rules 931100 ("RFI: URL parameter using IP address") and 934110 ("SSRF: metadata/loopback
+    #       URL in parameter") block that. Keycloak never fetches redirect_uri; it only compares it with the client's
+    #       registered list, so neither risk applies. Both rules are disabled for the redirect_uri ARGUMENT ONLY, on
+    #       Keycloak's authorize and token endpoints only; every other argument and path is still inspected.
+    SecRule REQUEST_FILENAME "@rx ^/auth/realms/ticketing/protocol/openid-connect/(?:auth|token)$" \
+        "id:1000210,phase:1,pass,nolog,t:none,ctl:ruleRemoveTargetById=931100;ARGS:redirect_uri,ctl:ruleRemoveTargetById=934110;ARGS:redirect_uri"
 
   # Configure-time exclusions (loaded AFTER the CRS rules), e.g. SecRuleUpdateTargetById to stop a
   # rule inspecting one parameter everywhere. Path-specific exclusions go in ticketing-before.conf.
@@ -148,7 +158,7 @@ spec:
       annotations:
         # Rules are mounted with subPath, which does NOT update a running pod. After editing the
         # ConfigMap above, bump this number so `kubectl apply -k k8s` restarts the WAF.
-        ticketing/config-version: "3"
+        ticketing/config-version: "6"
     spec:
       automountServiceAccountToken: false
       securityContext:

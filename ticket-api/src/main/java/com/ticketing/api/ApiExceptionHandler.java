@@ -12,24 +12,15 @@ import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+/** REST rendering of {@link ApiErrors}: RFC 7807 problem details. */
 @RestControllerAdvice
 class ApiExceptionHandler {
 
-    @ExceptionHandler(TicketNotFoundException.class)
-    ProblemDetail notFound(TicketNotFoundException e) {
-        return problem(HttpStatus.NOT_FOUND, e.getMessage());
-    }
-
-    @ExceptionHandler(TicketConflictException.class)
-    ProblemDetail conflict(TicketConflictException e) {
-        return problem(HttpStatus.CONFLICT, e.getMessage());
-    }
-
-    @ExceptionHandler({TicketForbiddenException.class, TenantAccessException.class, AccessDeniedException.class})
-    ProblemDetail forbidden(RuntimeException e) {
-        // AccessDeniedException's message is framework text; do not echo it.
-        String detail = e instanceof AccessDeniedException ? "Your role in this tenant does not allow this operation" : e.getMessage();
-        return problem(HttpStatus.FORBIDDEN, detail);
+    @ExceptionHandler({TicketNotFoundException.class, TicketConflictException.class, TicketForbiddenException.class,
+            TenantAccessException.class, AccessDeniedException.class})
+    ProblemDetail known(RuntimeException e) {
+        ApiErrors.ApiError error = ApiErrors.classify(e).orElseThrow(() -> e);
+        return ProblemDetail.forStatusAndDetail(error.status(), error.detail());
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
@@ -37,10 +28,6 @@ class ApiExceptionHandler {
         String detail = e.getBindingResult().getFieldErrors().stream()
                 .map(f -> f.getField() + " " + f.getDefaultMessage())
                 .collect(Collectors.joining("; "));
-        return problem(HttpStatus.BAD_REQUEST, detail);
-    }
-
-    private static ProblemDetail problem(HttpStatus status, String detail) {
-        return ProblemDetail.forStatusAndDetail(status, detail);
+        return ProblemDetail.forStatusAndDetail(HttpStatus.BAD_REQUEST, detail);
     }
 }

@@ -18,10 +18,10 @@ import org.springframework.transaction.annotation.Transactional;
 @Component
 public class OutboxStore {
 
-    /** One history event waiting to be (or already) projected into MongoDB. */
+    /** One history event waiting to be (or already) projected into MongoDB. {@code channel}: REST or MCP. */
     public record OutboxEvent(UUID id, String tenantId, UUID ticketId, long ticketVersion, String type,
-                              String actor, String comment, String title, String mobile, String description,
-                              Instant occurredAt, int attempts) {
+                              String actor, String channel, String comment, String title, String mobile,
+                              String description, Instant occurredAt, int attempts) {
     }
 
     /** Health of the outbox for metrics and alerts. */
@@ -30,7 +30,7 @@ public class OutboxStore {
 
     private static final RowMapper<OutboxEvent> ROW = (rs, n) -> new OutboxEvent(
             rs.getObject("id", UUID.class), rs.getString("tenant_id"), rs.getObject("ticket_id", UUID.class),
-            rs.getLong("ticket_version"), rs.getString("event_type"), rs.getString("actor"), rs.getString("comment"),
+            rs.getLong("ticket_version"), rs.getString("event_type"), rs.getString("actor"), rs.getString("channel"), rs.getString("comment"),
             rs.getString("title"), rs.getString("mobile"), rs.getString("description"),
             rs.getTimestamp("occurred_at").toInstant(), rs.getInt("attempts"));
 
@@ -44,10 +44,10 @@ public class OutboxStore {
     @Transactional(propagation = Propagation.MANDATORY)
     public void append(OutboxEvent e) {
         jdbc.update("""
-                insert into ticket_outbox (id, tenant_id, ticket_id, ticket_version, event_type, actor, comment,
+                insert into ticket_outbox (id, tenant_id, ticket_id, ticket_version, event_type, actor, channel, comment,
                                            title, mobile, description, occurred_at)
-                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                e.id(), e.tenantId(), e.ticketId(), e.ticketVersion(), e.type(), e.actor(), e.comment(),
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                e.id(), e.tenantId(), e.ticketId(), e.ticketVersion(), e.type(), e.actor(), e.channel(), e.comment(),
                 e.title(), e.mobile(), e.description(), Timestamp.from(e.occurredAt()));
     }
 

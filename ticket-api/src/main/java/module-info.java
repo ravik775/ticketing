@@ -25,6 +25,9 @@ module com.ticketing.api {
     requires jakarta.validation;
     requires com.fasterxml.jackson.databind;
     requires org.slf4j;
+    requires micrometer.core;
+    // MCP server (Spring AI): only the tool annotations are referenced at compile time (automatic module).
+    requires mcp.annotations;
 
     opens com.ticketing to spring.core, spring.beans, spring.context;
     opens com.ticketing.api to spring.core, spring.beans, spring.context, spring.web, spring.webmvc, com.fasterxml.jackson.databind;

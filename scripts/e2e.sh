@@ -104,6 +104,53 @@ call POST "/api/tickets/$ID2/respond" "$ALICE" acme '{"comment":"The VPN gateway
 expect "applicant answers" 200
 expect_body "ticket is back in the approvers' queue" '"status":"OPEN"'
 
+echo; echo "== MCP endpoint /api/mcp (AI agents): same gateway, security chain, rules and validation as REST"
+mcp() {  # token tenant tool arguments-json  -> JSON-RPC tools/call; the tool result is JSON text inside "content"
+  local body="{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$3\",\"arguments\":$4}}"
+  local args=(-sk --max-time 20 -o "$OUT" -w '%{http_code}' -X POST -H 'Content-Type: application/json'
+              -H 'Accept: application/json, text/event-stream' -d "$body")
+  [ -n "$1" ] && args+=(-H "Authorization: Bearer $1")
+  [ -n "$2" ] && args+=(-H "X-Tenant-ID: $2")
+  STATUS="$(curl "${args[@]}" "$BASE/api/mcp")"
+}
+HDR="$(curl -sk --max-time 20 -o /dev/null -D - -X POST -H 'Content-Type: application/json' -d '{}' "$BASE/api/mcp" | tr -d '\r')"
+STATUS="$(printf '%s' "$HDR" | head -1 | awk '{print $2}')"; expect "MCP without a token is rejected at the gateway" 401
+printf '%s\n' "$HDR" > "$OUT"; expect_body "the 401 points MCP clients to the OAuth metadata (RFC 9728)" 'resource_metadata="https://[^"]*/.well-known/oauth-protected-resource/api/mcp"'
+call GET /.well-known/oauth-protected-resource/api/mcp ""; expect "protected-resource metadata is published" 200
+expect_body "metadata names Keycloak as the authorization server" '"authorization_servers":\["https://[^"]*/auth/realms/ticketing"\]'
+STATUS="$(curl -sk --max-time 20 -o "$OUT" -w '%{http_code}' -X POST -H "Authorization: Bearer $BOB" -H 'Content-Type: application/json' \
+  -H 'Accept: application/json, text/event-stream' -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$BASE/api/mcp")"
+expect "tools/list works for a signed-in user" 200
+expect_body "the three tools are offered" '"name":"decide_ticket"'
+mcp "$ERIN" acme create_ticket '{"title":"MCP laptop","mobile":"+919876543210","description":"Raised by an AI agent"}'
+expect "applicant raises a ticket over MCP" 200
+expect_body "the new ticket is OPEN" 'status\\":\\"OPEN'
+MCP_ID="$(grep -o '\\"id\\":\\"[0-9a-f-]*' "$OUT" | head -1 | grep -o '[0-9a-f-]\{36\}')"
+STATUS="$(curl -sk --max-time 20 -o /dev/null -D - -X POST -H "Authorization: Bearer $ERIN" -H 'X-Tenant-ID: acme' \
+  -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' "$BASE/api/mcp" | tr -d '\r' | grep -ci '^x-ratelimit-remaining-minute:')"
+expect "Kong's per-user rate limit applies to MCP calls" 1
+mcp "$ERIN" acme create_ticket '{"title":"x","mobile":"abc","description":"x"}'
+expect_body "MCP input is validated like REST (same message)" 'mobile must be 7-15 digits'
+mcp "$BOB" acme create_ticket '{"title":"x","mobile":"+919876543210","description":"x"}'
+expect_body "an approver cannot raise tickets over MCP either" '403 Forbidden'
+mcp "$ERIN" acme get_ticket "{\"ticketId\":\"$MCP_ID\"}"
+expect_body "get_ticket refuses callers without approval rights" '403 Forbidden'
+mcp "$DAVE" globex get_ticket "{\"ticketId\":\"$MCP_ID\"}"
+expect_body "get_ticket does not reveal another tenant's ticket" '404 Not Found'
+call POST "/api/approvals/tickets/$MCP_ID/claim" "$CAROL" acme; expect "carol picks the ticket up over REST" 200
+mcp "$BOB" acme decide_ticket "{\"ticketId\":\"$MCP_ID\",\"decision\":\"APPROVE\",\"comment\":\"\"}"
+expect_body "a decision without a comment is refused" 'comment must not be blank'
+mcp "$BOB" acme decide_ticket "{\"ticketId\":\"$MCP_ID\",\"decision\":\"APPROVE\",\"comment\":\"Approved via agent\"}"
+expect_body "bob decides over MCP: carol's lock released, claimed and approved in one step" 'status\\":\\"APPROVED'
+call GET "/api/tickets/$MCP_ID" "$ERIN" acme;  expect "the applicant sees the outcome over REST" 200
+expect_body "history records who decided and that it came through MCP" '"type":"APPROVE","actor":"bob@ticketing.test","channel":"MCP"'
+expect_body "history records the lock takeover step" '"type":"UNLOCKED","actor":"bob@ticketing.test","channel":"MCP"'
+mcp "$BOB" acme decide_ticket "{\"ticketId\":\"$MCP_ID\",\"decision\":\"REJECT\",\"comment\":\"again\"}"
+expect_body "a decided ticket cannot be decided again" '409 Conflict'
+mcp "$ERIN" acme create_ticket "{\"title\":\"1' OR '1'='1\",\"mobile\":\"+919876543210\",\"description\":\"x' UNION SELECT password FROM users--\"}"
+expect "the WAF inspects MCP request bodies too (SQL injection blocked)" 403
+
 echo; echo "== Web Application Firewall (ModSecurity + OWASP CRS in front of Kong)"
 waf() { STATUS="$(curl -sk --max-time 20 -o "$OUT" -w '%{http_code}' "$@")"; }
 waf "$BASE/api/tickets?status=1%27%20OR%20%271%27=%271" -H "Authorization: Bearer $BOB"
@@ -122,6 +169,11 @@ waf "$BASE/auth/admin/master/console/";             expect "Keycloak admin conso
 waf -X POST "$BASE/auth/realms/master/protocol/openid-connect/token" -d grant_type=password -d client_id=admin-cli -d username=admin -d password=x
 expect "admin (master) realm login is not reachable from outside" 403
 waf "$BASE/auth/realms/ticketing/.well-known/openid-configuration"; expect "application realm stays reachable for sign-in" 200
+AUTHZ="$BASE/auth/realms/ticketing/protocol/openid-connect/auth?client_id=ticketing-mcp&response_type=code&code_challenge_method=S256&code_challenge=abcdefghijklmnopqrstuvwxyzabcdefghijklmnopq"
+waf "$AUTHZ&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback"
+expect "MCP client sign-in with a loopback redirect passes the WAF (FP-2 exclusion)" 200
+waf "$AUTHZ&redirect_uri=http%3A%2F%2F127.0.0.1%3A53682%2Fcallback&login_hint=http%3A%2F%2F169.254.169.254%2Flatest%2Fmeta-data"
+expect "the exclusion is narrow: a metadata URL in any other argument is still blocked" 403
 waf -I "$BASE/";                                    expect_body "responses do not reveal the proxy software version" 'erver: waf'
 
 echo; echo "== Zero Trust / network (needs kubectl access to the cluster)"

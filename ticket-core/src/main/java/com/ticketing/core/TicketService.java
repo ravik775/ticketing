@@ -13,6 +13,7 @@ import com.ticketing.security.Role;
 import com.ticketing.security.TenantContext;
 import com.ticketing.security.TenantContextHolder;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -75,7 +76,8 @@ public class TicketService {
             OutboxEvent e = change.event();
             details = new TicketDocument(workflow.getId().toString(), ctx.tenantId(), e.title(), e.mobile(),
                     e.description(), ctx.email(), e.occurredAt(),
-                    List.of(new TicketDocument.EventDoc(e.id().toString(), e.type(), e.actor(), null, e.occurredAt())));
+                    List.of(new TicketDocument.EventDoc(e.id().toString(), e.type(), e.actor(), e.channel(), null,
+                            e.occurredAt())));
         }
         return toView(workflow, details);
     }
@@ -112,6 +114,20 @@ public class TicketService {
         return viewOf(List.of(workflows.get(id))).get(0);
     }
 
+    /**
+     * A ticket the caller is permitted to approve: they must be an APPROVER in the active tenant (RLS limits
+     * the lookup to that tenant) and must not have raised it themselves (separation of duties). Anything
+     * else is reported as "not found", so the answer does not reveal tickets the caller may not act on.
+     */
+    public TicketView ticketForApproval(UUID id) {
+        TenantContext ctx = require(Role.APPROVER);
+        TicketWorkflow workflow = workflows.get(id);
+        if (workflow.getOwnerEmail().equalsIgnoreCase(ctx.email())) {
+            throw new TicketNotFoundException("Ticket not found");
+        }
+        return viewOf(List.of(workflow)).get(0);
+    }
+
     /** Pick up (lock) a ticket. Approvers can never pick up a ticket they raised themselves (403). */
     public TicketView claim(UUID id) {
         TenantContext ctx = require(Role.APPROVER);
@@ -132,6 +148,32 @@ public class TicketService {
         return mutate(id, w -> {
             w.decide(ctx.email(), request.decision());
             return new EventSpec(request.decision().name(), request.comment());
+        });
+    }
+
+    /**
+     * Decide in one step, atomically: if another approver holds the lock it is released, the caller picks
+     * the ticket up, and the decision is applied, all in ONE transaction (all or nothing). Each step is
+     * recorded in the history (UNLOCKED, CLAIMED, then the decision) with the caller as actor and the path
+     * used (REST or MCP). If the caller already holds the lock, only the decision is recorded.
+     *
+     * <p>Rules are unchanged: APPROVER role in the active tenant, never on one's own ticket, and only
+     * tickets that are OPEN or LOCKED can be decided (a decided or MORE_INFO ticket gives 409).
+     */
+    public TicketView claimAndDecide(UUID id, DecisionRequest request) {
+        TenantContext ctx = require(Role.APPROVER);
+        return mutateAll(id, w -> {
+            List<EventSpec> steps = new ArrayList<>(3);
+            if (w.getStatus() == TicketStatus.LOCKED && !ctx.email().equals(w.getLockedBy())) {
+                steps.add(new EventSpec("UNLOCKED", "Lock held by " + w.unlock(ctx.email()) + " released to decide"));
+            }
+            if (w.getStatus() != TicketStatus.LOCKED) {
+                String takenOver = w.claim(ctx.email(), lockTimeout);
+                steps.add(new EventSpec("CLAIMED", takenOver == null ? null : "Stale lock held by " + takenOver + " taken over"));
+            }
+            w.decide(ctx.email(), request.decision());
+            steps.add(new EventSpec(request.decision().name(), request.comment()));
+            return steps;
         });
     }
 
@@ -169,13 +211,18 @@ public class TicketService {
 
     /** Runs the transition with its outbox event in one transaction, then projects the event. */
     private TicketView mutate(UUID id, Function<TicketWorkflow, EventSpec> transition) {
+        return mutateAll(id, w -> List.of(transition.apply(w)));
+    }
+
+    /** Runs several steps with their outbox events in one transaction, then projects them in order. */
+    private TicketView mutateAll(UUID id, Function<TicketWorkflow, List<EventSpec>> transitions) {
         Change change;
         try {
-            change = workflows.update(id, transition);
+            change = workflows.updateAll(id, transitions);
         } catch (OptimisticLockingFailureException e) {
             throw new TicketConflictException("Ticket was modified by someone else; reload and retry");
         }
-        publisher.publishNow(change.event());
+        change.events().forEach(publisher::publishNow);
         return viewOf(List.of(change.workflow())).get(0);
     }
 
@@ -186,7 +233,7 @@ public class TicketService {
 
     private static TicketView toView(TicketWorkflow w, TicketDocument d) {
         List<TicketEventView> events = d == null || d.events() == null ? List.of()
-                : d.events().stream().map(e -> new TicketEventView(e.type(), e.actor(), e.comment(), e.at())).toList();
+                : d.events().stream().map(e -> new TicketEventView(e.type(), e.actor(), e.channel(), e.comment(), e.at())).toList();
         return new TicketView(w.getId(), w.getTenantId(),
                 d == null ? "(details unavailable)" : d.title(),
                 d == null ? null : d.mobile(),

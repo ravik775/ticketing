@@ -81,7 +81,7 @@ public class DocumentStore {
     }
 
     private static TicketDocument.EventDoc eventDoc(OutboxEvent e) {
-        return new TicketDocument.EventDoc(e.id().toString(), e.type(), e.actor(), e.comment(), e.occurredAt());
+        return new TicketDocument.EventDoc(e.id().toString(), e.type(), e.actor(), e.channel(), e.comment(), e.occurredAt());
     }
 
     public Map<UUID, TicketDocument> findByIds(Collection<UUID> ids) {

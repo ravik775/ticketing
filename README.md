@@ -17,7 +17,7 @@ full observability with security alerting, and a CI/CD pipeline. It runs end to 
 | **What it does** | Employees of several companies (tenants) raise tickets; approvers in each company pick them up, lock them and approve, reject or ask for more details |
 | **Architecture style** | Modular Spring Boot service behind an edge WAF and API gateway; Zero Trust (every hop authenticated); shared database with row-level security per tenant |
 | **Runs on** | Kubernetes (k3s). Locally a single-node k3d cluster; production design for AWS EKS in [docs/07](docs/07-aws-deployment.md) |
-| **Quality evidence** | 43 automated tests (0 skipped), 56 live end-to-end checks, 15 observability checks, a restore drill, a k6 load-test baseline (36.6 req/s, p95 109 ms, 0 % errors on a laptop) |
+| **Quality evidence** | 50 automated tests (0 skipped), 79 live end-to-end checks, 15 observability checks, a restore drill, a k6 load-test baseline (36.6 req/s, p95 109 ms, 0 % errors on a laptop) |
 | **Documentation** | an operations handbook for maintainers ([docs/](docs/README.md)), an [enterprise gap assessment](docs/enterprise-gap.md), and an [interview/architecture question bank](interview/README.md) |
 
 ### Highlights
@@ -28,12 +28,13 @@ full observability with security alerting, and a CI/CD pipeline. It runs end to 
 * **Operable:** metrics, logs, traces, SLO burn-rate alerts and a local SIEM (Kubernetes audit, Keycloak events, WAF blocks) with detection rules proven to fire.
 * **Recoverable and secret-free:** WAL/oplog backups with a point-in-time restore drill; all credentials in OpenBao (Vault-compatible) and rotated; none in Git.
 * **Shippable:** GitHub Actions with a no-skipped-tests gate, vulnerability scanning, SBOM, signed images and an in-pipeline Kubernetes end-to-end test.
+* **AI-agent ready:** an **MCP endpoint** (`/api/mcp`) lets assistants raise and decide tickets as the signed-in user, through the same gateway, rules and validation as REST; every history entry records whether it came via REST or MCP.
 
 ### Technology stack
 
 | Area | Technology |
 |---|---|
-| Backend | Java 21, Spring Boot 3.5 (Web, Security OAuth2 Resource Server, Data JPA, Data MongoDB, Actuator), Java Platform Module System, Flyway, Micrometer + OpenTelemetry |
+| Backend | Java 21, Spring Boot 3.5 (Web, Security OAuth2 Resource Server, Data JPA, Data MongoDB, Actuator), Spring AI MCP server (Model Context Protocol), Java Platform Module System, Flyway, Micrometer + OpenTelemetry |
 | Frontend | Dependency-free single-page app (vanilla JavaScript, OIDC Authorization Code + PKCE), nginx with a strict Content-Security-Policy |
 | Data | PostgreSQL 16 (workflow state, row-level security, transactional outbox), MongoDB 7 (ticket documents and history) |
 | Identity | Keycloak 26 (OIDC, Google sign-in brokering, per-tenant groups as roles) |
@@ -105,7 +106,7 @@ Detailed walkthrough: [docs/04-architecture.md](docs/04-architecture.md).
 | Requirement | How it is met |
 |---|---|
 | Tenant isolation | Four layers: tenant only from the validated token (`X-Tenant-ID` merely *selects* one the token proves); Hibernate `@TenantId`; PostgreSQL row-level security, **forced** and fail-closed; every MongoDB query filtered by tenant in the one class allowed to touch it |
-| Authentication | Keycloak, Authorization Code + **PKCE** (S256), 5-minute RS256 access tokens; the service accepts only access tokens (`typ=Bearer`) issued to the UI client (`azp`) |
+| Authentication | Keycloak, Authorization Code + **PKCE** (S256), 5-minute RS256 access tokens; the service accepts only access tokens (`typ=Bearer`) issued to the UI or the MCP client (`azp`); MCP-client tokens must also be issued for this API (`aud`) |
 | Authorization | per-tenant roles from Keycloak groups `/<tenant>/applicant` and `/<tenant>/approver`; `@PreAuthorize` method security; separation of duties also as a database `CHECK` |
 | Service-to-service | WAF→Kong TLS with verification; Kong→service **mTLS**, client certificate pinned to `CN=kong-gateway`; service→Keycloak TLS; all certificates from a cert-manager private CA |
 | Network | default-deny ingress **and** egress NetworkPolicies in every namespace, explicit allows only |
@@ -180,7 +181,7 @@ What `up.sh` does, step by step:
 
 ```bash
 kubectl get pods -A                     # everything Running / Completed
-bash scripts/e2e.sh                     # 56 checks: WAF, TLS/mTLS, NetworkPolicies, admin lockdown, full workflow
+bash scripts/e2e.sh                     # 79 checks: WAF, TLS/mTLS, NetworkPolicies, admin lockdown, workflow, MCP
 bash scripts/verify-observability.sh    # 15 checks: metrics, logs, traces, alert rules, a simulated attack alert
 ```
 
@@ -289,15 +290,28 @@ Errors use RFC 7807 problem details. Over-quota tenants receive **429** with `Re
 expire by default; set `TICKET_LOCK_TIMEOUT` (e.g. `PT30M`) to allow takeover of old locks (recorded in
 the history).
 
+### MCP tools for AI agents (`/api/mcp`)
+
+The same use cases as MCP tools (Model Context Protocol, stateless Streamable HTTP), secured exactly like the
+REST API and called with the user's own token (Keycloak client `ticketing-mcp`, PKCE + consent).
+
+| Tool | Same as | Who |
+|---|---|---|
+| `create_ticket {title, mobile, description}` | `POST /api/tickets` | applicant |
+| `decide_ticket {ticketId, decision, comment}` | claim + decision in **one atomic step**; releases another approver's lock first | approver, not on own tickets |
+| `get_ticket {ticketId}` | a ticket the caller is permitted to approve | approver |
+
+Details, client set-up and the design decisions (including `/api/mcp` versus `/mcp`): [docs/10](docs/10-mcp-integration.md).
+
 ---
 
 ## Testing and quality
 
 | Level | What | How |
 |---|---|---|
-| Unit and slice | domain rules, security filters, tenant resolution, quotas | `./mvnw verify` |
-| Integration | real PostgreSQL and MongoDB (Testcontainers): row-level security, outbox recovery, full workflow | `./mvnw verify` |
-| End to end | 56 checks against the running cluster through the WAF: attacks blocked, mTLS enforced, NetworkPolicies, admin lockdown, cross-tenant access refused, the approval workflow | `scripts/e2e.sh` |
+| Unit and slice | domain rules, security filters, tenant resolution, quotas, token client/audience rules | `./mvnw verify` |
+| Integration | real PostgreSQL and MongoDB (Testcontainers): row-level security, outbox recovery, full workflow, MCP tools (RBAC, validation, atomic decision, channel audit) | `./mvnw verify` |
+| End to end | 79 checks against the running cluster through the WAF: attacks blocked, mTLS enforced, NetworkPolicies, admin lockdown, cross-tenant access refused, the approval workflow, the MCP endpoint | `scripts/e2e.sh` |
 | Operability | metrics, logs, traces, alert rules, a simulated attack that must raise an alert | `scripts/verify-observability.sh` |
 | Recovery | restore to a point in time in throw-away pods | `scripts/restore-drill.sh` |
 | Performance | k6, 20 users: 36.6 req/s, p50 36 ms, p95 109 ms, 0 % errors | `scripts/load-test.sh` |

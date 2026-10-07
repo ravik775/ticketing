@@ -15,6 +15,7 @@ does and what you should expect to see.
 | 7 | [Hosting on AWS](07-aws-deployment.md) | move the platform to AWS with a public (trusted) certificate |
 | 8 | [Security and Zero Trust](08-security-zero-trust.md) | understand every security control and why it exists |
 | 9 | [Web Application Firewall](09-waf-firewall.md) | understand, test and tune the firewall in front of the gateway |
+| 10 | [MCP endpoint for AI agents](10-mcp-integration.md) | connect an AI assistant, understand how agent actions are secured and audited |
 | – | [Enterprise gap assessment](enterprise-gap.md) | see how the platform scores against enterprise production, what was fixed and what is still open |
 
 ---

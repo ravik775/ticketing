@@ -28,7 +28,7 @@ approval**; interviewers expect you to separate "what runs today" from "what I w
 | 12 | [Scaling](12-Scaling.md) | capacity, availability math, DR, caching, cost |
 | 13 | [Observability](13-Observability.md) | SLOs, tracing, dashboards, alerting |
 | 14 | [Audit & Alerting](14-Audit-and-Alerting.md) | **breach detection, tamper-evident audit, silent-slip inventory, alerting** |
-| 15 | [AI Governance & Observability](15-AI-Governance-and-Observability.md) | **introducing AI**: AI gateway, RAG tenant isolation, prompt injection, GenAI telemetry |
+| 15 | [AI Governance & Observability](15-AI-Governance-and-Observability.md) | **introducing AI**: AI gateway, RAG tenant isolation, prompt injection, GenAI telemetry (incl. the implemented MCP endpoint for AI agents) |
 | 16 | [Governance](16-Governance.md) | TOGAF, dispensations, licences, **where governance is imposed** |
 | 17 | [Maintainability](17-Maintainability.md) | testing strategy, CI/CD, debt register, upgrades |
 | 18 | [Enterprise Integration](18-Enterprise-Integration.md) | customer IdP federation, SCIM, MFA step-up, BYOK, webhooks, incident response |
@@ -85,7 +85,7 @@ approval**; interviewers expect you to separate "what runs today" from "what I w
 | Zero Trust hops | Browser→WAF TLS; WAF→Kong TLS verified; Kong→API **mTLS** + CN pin `kong-gateway`; API re-validates JWT (`iss`, `exp`, `typ=Bearer`, `azp`) |
 | Data | PostgreSQL: forced, fail-closed RLS, single instance + WAL archive/PITR, 5 s statement timeout, transactional outbox; MongoDB: 1-member replica set + oplog backups, tenant filter in one class |
 | Silent slips closed | Mongo history loss (outbox + idempotent projection, rebuild test); skipped tests (CI fails on skips); cert reload still manual (`scripts/reload-certs.sh`) but now covered by `CertificateExpiresSoon`/`CertificateNotReady` alerts; Keycloak events + k8s audit now on, shipped to Loki with alert rules |
-| Tests | `mvn verify` (43 tests incl. Testcontainers, 0 skipped), `scripts/e2e.sh` (56 live checks), `scripts/verify-observability.sh` (15 checks), `scripts/restore-drill.sh` (PITR) |
+| Tests | `mvn verify` (50 tests incl. Testcontainers, 0 skipped), `scripts/e2e.sh` (79 live checks incl. MCP), `scripts/verify-observability.sh` (15 checks), `scripts/restore-drill.sh` (PITR) |
 | Accepted gaps | none open: both former gaps (demo passwords; admin console via WAF) were closed on 2026-10-05 |
 
 ## How to study

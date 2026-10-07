@@ -61,9 +61,10 @@ In `k8s/80-waf.yaml` → ConfigMap `waf-config` → `ticketing-before.conf` (loa
 | ID | Rule | Effect |
 |---|---|---|
 | 1000100 | **Administration is internal only**: `/auth/admin…` (Keycloak admin console and REST API) and `/auth/realms/master…` (the admin realm) are refused. Only the methods the public application uses are allowed: `GET HEAD POST OPTIONS` (CRS default) | admin paths → 403 (admins use `kubectl port-forward`, guide 1.2); other methods → 403 (CRS rule 911100). Kong blocks the same paths as a second layer |
-| 1000110 | **Path allow list**: `/`, `/index.html`, `/app.js`, `/styles.css`, `/favicon.ico`, `/api/…`, `/auth…` | anything else → 404 before it reaches Kong |
+| 1000110 | **Path allow list**: `/`, `/index.html`, `/app.js`, `/styles.css`, `/favicon.ico`, `/api/…` (includes the MCP endpoint `/api/mcp`), `/auth…`, `/.well-known/oauth-protected-resource…` (MCP OAuth discovery) | anything else → 404 before it reaches Kong |
 | 1000120 | API bodies must be `application/json` (requests without a body are fine) | → 415 |
 | 1000200 | **False-positive exclusion FP-1**: rule 920180 ("POST without Content-Length") is switched off for `/api/approvals/tickets/<id>/claim` and `/unlock` only | lets body-less approver actions through cleanly |
+| 1000210 | **False-positive exclusion FP-2**: rules 931100 and 934110 ignore `redirect_uri` on Keycloak's `/auth` and `/token` endpoints only | lets MCP clients sign in with a loopback redirect (`http://127.0.0.1:<port>/…`) |
 
 > **When the UI gets a new file** (e.g. `logo.svg`), add it to rule 1000110, or the WAF answers 404
 > for it. This is the price of a positive security model, and it is worth it: scanners probing for
@@ -165,7 +166,7 @@ personal data out of the logs the records contain the request line but no header
    (9.7) and note the **rule ID**, the **path**, and the matched **variable** (inside `"match"`, e.g.
    `ARGS:comment` or `REQUEST_HEADERS:User-Agent`).
 2. **Confirm it is legitimate.** Reproduce it; make sure it is not an actual attack.
-3. **Add the narrowest exclusion** to `ticketing-before.conf`, with the next free ID (1000210, 1000220…)
+3. **Add the narrowest exclusion** to `ticketing-before.conf`, with the next free ID (1000220, 1000230…)
    and a comment explaining why:
 
    * Turn one rule off for one path (this is how FP-1 is written):
@@ -180,7 +181,7 @@ personal data out of the logs the records contain the request line but no header
 
      ```
      SecRule REQUEST_URI "@rx ^/api/approvals/tickets/[^/]+/decision$" \
-         "id:1000210,phase:1,pass,nolog,t:none,ctl:ruleRemoveTargetById=942100;ARGS:json.comment"
+         "id:1000220,phase:1,pass,nolog,t:none,ctl:ruleRemoveTargetById=942100;ARGS:json.comment"
      ```
 
    * Never switch a rule off everywhere, never raise the paranoia threshold for one complaint, and
@@ -193,6 +194,15 @@ Content-Length and Transfer-Encoding headers", 3 points) on successful `claim`/`
 POSTs without a body; some clients then omit `Content-Length`. 3 points alone do not block, but one
 more weak signal would have blocked an approver, so the rule was excluded for exactly those two
 endpoints.
+
+**Real example (FP-2):** the first real sign-in of an MCP client (AI agent, guide 10) failed with an empty
+403. The audit log showed rules **931100** ("RFI: URL parameter using IP address") and then **934110**
+("SSRF: loopback/metadata URL in parameter"), both matching `ARGS:redirect_uri` =
+`http://127.0.0.1:53682/callback`. Native OAuth clients must use such a loopback redirect (RFC 8252), and
+Keycloak never *fetches* `redirect_uri`, it only compares it with the client's registered list, so neither
+risk applies. Rule 1000210 removes **only those two rules, only for the `redirect_uri` argument, only on
+Keycloak's authorize and token endpoints**. `scripts/e2e.sh` proves both sides: the loopback sign-in passes,
+and a metadata URL in any other argument of the same request is still blocked.
 
 ## 9.9 Emergency: switch to detection-only
 

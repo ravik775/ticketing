@@ -77,6 +77,7 @@ class ApiSecurityTest {
     @Test
     void anonymousIsRejected() throws Exception {
         mvc.perform(get("/api/tickets")).andExpect(status().isUnauthorized());
+        mvc.perform(post("/api/mcp").contentType(MediaType.APPLICATION_JSON).content("{}")).andExpect(status().isUnauthorized());
         verifyNoInteractions(service);
     }
 

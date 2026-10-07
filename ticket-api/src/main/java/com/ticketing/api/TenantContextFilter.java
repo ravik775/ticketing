@@ -1,6 +1,7 @@
 package com.ticketing.api;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.ticketing.security.AccessChannel;
 import com.ticketing.security.TenantAccessException;
 import com.ticketing.security.TenantContext;
 import com.ticketing.security.TenantContextHolder;
@@ -30,6 +31,9 @@ import org.springframework.web.filter.OncePerRequestFilter;
 class TenantContextFilter extends OncePerRequestFilter {
 
     static final String TENANT_HEADER = "X-Tenant-ID";
+
+    /** Requests to this path come from AI agents over MCP; everything else under /api is REST. */
+    static final String MCP_PATH = "/api/mcp";
 
     private final ObjectMapper mapper;
 
@@ -67,6 +71,8 @@ class TenantContextFilter extends OncePerRequestFilter {
                     return;
                 }
                 TenantContextHolder.set(context);
+                // Server-decided (from the endpoint that received the request); recorded with every history event.
+                AccessChannel.set(MCP_PATH.equals(request.getRequestURI()) ? AccessChannel.MCP : AccessChannel.REST);
                 SecurityContextHolder.getContext().setAuthentication(new JwtAuthenticationToken(
                         jwtAuth.getToken(),
                         context.roles().stream().map(r -> new SimpleGrantedAuthority("ROLE_" + r.name())).toList(),
@@ -75,6 +81,7 @@ class TenantContextFilter extends OncePerRequestFilter {
             chain.doFilter(request, response);
         } finally {
             TenantContextHolder.clear();
+            AccessChannel.clear();
         }
     }
 }

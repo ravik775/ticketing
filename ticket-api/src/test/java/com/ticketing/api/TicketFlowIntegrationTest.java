@@ -12,11 +12,13 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.ticketing.TicketingApplication;
 import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import javax.sql.DataSource;
 import org.junit.jupiter.api.Test;
@@ -298,5 +300,154 @@ class TicketFlowIntegrationTest {
             rs.next();
             return rs.getLong(1);
         }
+    }
+
+    // ---------------------------------------------------------------- MCP endpoint (/api/mcp)
+
+    /** One stateless MCP JSON-RPC call (tools/call) through the full security chain. */
+    private JsonNode mcp(JwtRequestPostProcessor as, String tenant, String tool, String arguments) throws Exception {
+        String body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"" + tool
+                + "\",\"arguments\":" + arguments + "}}";
+        var request = post("/api/mcp").with(as).contentType(MediaType.APPLICATION_JSON)
+                .accept(MediaType.APPLICATION_JSON, MediaType.TEXT_EVENT_STREAM).content(body);
+        if (tenant != null) {
+            request.header("X-Tenant-ID", tenant);
+        }
+        String response = mvc.perform(request).andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        return json.readTree(response).get("result");
+    }
+
+    /** The ticket returned by a successful tool call (JSON text content, the same JSON as the REST response). */
+    private JsonNode ticket(JsonNode result) throws Exception {
+        assertThat(result.get("isError").asBoolean()).as("tool call failed: %s", result).isFalse();
+        return json.readTree(result.get("content").get(0).get("text").asText());
+    }
+
+    private static String errorText(JsonNode result) {
+        assertThat(result.get("isError").asBoolean()).as("tool result should be an error: %s", result).isTrue();
+        return result.get("content").get(0).get("text").asText();
+    }
+
+    private List<String> outboxColumn(String ticketId, String column) throws Exception {
+        try (Connection c = dataSource.getConnection(); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery("SELECT " + column + " FROM ticket_outbox WHERE ticket_id = '" + ticketId
+                     + "' ORDER BY occurred_at")) {
+            List<String> values = new ArrayList<>();
+            while (rs.next()) {
+                values.add(rs.getString(1));
+            }
+            return values;
+        }
+    }
+
+    @Test
+    void mcpListsExactlyTheThreeTools() throws Exception {
+        String response = mvc.perform(post("/api/mcp").with(user("list@acme.test", "/acme/approver"))
+                        .contentType(MediaType.APPLICATION_JSON).accept(MediaType.APPLICATION_JSON, MediaType.TEXT_EVENT_STREAM)
+                        .content("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}"))
+                .andExpect(status().isOk()).andReturn().getResponse().getContentAsString();
+        JsonNode tools = json.readTree(response).get("result").get("tools");
+        List<String> names = new ArrayList<>();
+        tools.forEach(t -> names.add(t.get("name").asText()));
+        assertThat(names).containsExactlyInAnyOrder("create_ticket", "decide_ticket", "get_ticket");
+        for (JsonNode tool : tools) {
+            if ("decide_ticket".equals(tool.get("name").asText())) {
+                assertThat(tool.get("annotations").get("destructiveHint").asBoolean()).isTrue();
+                assertThat(tool.get("inputSchema").toString()).contains("APPROVE", "REJECT", "REQUEST_INFO");
+            }
+        }
+    }
+
+    @Test
+    void mcpCreateTicketUsesTheSameRulesAsRestAndRecordsTheChannel() throws Exception {
+        var alice = user("mcp-alice@acme.test", "/acme/applicant");
+        JsonNode created = mcp(alice, "acme", "create_ticket",
+                "{\"title\":\"Laptop\",\"mobile\":\"+919876543210\",\"description\":\"New laptop needed\"}");
+        assertThat(created.get("isError").asBoolean()).as(created.toString()).isFalse();
+        JsonNode ticket = ticket(created);
+        assertThat(ticket.get("status").asText()).isEqualTo("OPEN");
+        assertThat(ticket.get("createdBy").asText()).isEqualTo("mcp-alice@acme.test");   // from the token
+        String id = ticket.get("id").asText();
+        assertThat(outboxColumn(id, "channel")).containsExactly("MCP");
+
+        // Same validation and the same wording as POST /api/tickets.
+        assertThat(errorText(mcp(alice, "acme", "create_ticket",
+                "{\"title\":\"\",\"mobile\":\"abc\",\"description\":\"x\"}")))
+                .startsWith("400 Bad Request:").contains("mobile must be 7-15 digits").contains("title must not be blank");
+        // RBAC: approvers cannot raise tickets, as over REST.
+        assertThat(errorText(mcp(user("mcp-bob@acme.test", "/acme/approver"), "acme", "create_ticket",
+                "{\"title\":\"x\",\"mobile\":\"+919876543210\",\"description\":\"x\"}"))).startsWith("403 Forbidden");
+    }
+
+    @Test
+    void mcpDecideTakesOverAnotherApproversLockAtomicallyAndRecordsWhoAndHow() throws Exception {
+        var alice = user("mcp2-alice@acme.test", "/acme/applicant");
+        var bob = user("mcp2-bob@acme.test", "/acme/approver");
+        var carol = user("mcp2-carol@acme.test", "/acme/approver");
+        String id = createTicket(alice, "acme", "mcp decide");
+        mvc.perform(post("/api/approvals/tickets/" + id + "/claim").with(bob)).andExpect(status().isOk());
+
+        JsonNode decided = mcp(carol, "acme", "decide_ticket",
+                "{\"ticketId\":\"" + id + "\",\"decision\":\"APPROVE\",\"comment\":\"Approved by policy\"}");
+        assertThat(decided.get("isError").asBoolean()).as(decided.toString()).isFalse();
+        assertThat(ticket(decided).get("status").asText()).isEqualTo("APPROVED");
+
+        // One transaction, every step recorded: who did it and through which path.
+        assertThat(outboxColumn(id, "event_type")).containsExactly("CREATED", "CLAIMED", "UNLOCKED", "CLAIMED", "APPROVE");
+        assertThat(outboxColumn(id, "actor")).containsExactly("mcp2-alice@acme.test", "mcp2-bob@acme.test",
+                "mcp2-carol@acme.test", "mcp2-carol@acme.test", "mcp2-carol@acme.test");
+        assertThat(outboxColumn(id, "channel")).containsExactly("REST", "REST", "MCP", "MCP", "MCP");
+        mvc.perform(get("/api/tickets/" + id).with(alice))
+                .andExpect(jsonPath("$.events[4].type").value("APPROVE"))
+                .andExpect(jsonPath("$.events[4].actor").value("mcp2-carol@acme.test"))
+                .andExpect(jsonPath("$.events[4].channel").value("MCP"))
+                .andExpect(jsonPath("$.events[4].comment").value("Approved by policy"));
+
+        // A decided ticket cannot be decided again: 409, and nothing was written (all or nothing).
+        assertThat(errorText(mcp(bob, "acme", "decide_ticket",
+                "{\"ticketId\":\"" + id + "\",\"decision\":\"REJECT\",\"comment\":\"too late\"}"))).startsWith("409 Conflict");
+        assertThat(outboxCount(id, "true")).isEqualTo(5);
+    }
+
+    @Test
+    void mcpDecideOnAnOpenTicketClaimsThenDecides() throws Exception {
+        String id = createTicket(user("mcp3-alice@acme.test", "/acme/applicant"), "acme", "mcp more info");
+        JsonNode decided = mcp(user("mcp3-bob@acme.test", "/acme/approver"), "acme", "decide_ticket",
+                "{\"ticketId\":\"" + id + "\",\"decision\":\"REQUEST_INFO\",\"comment\":\"Which model?\"}");
+        assertThat(ticket(decided).get("status").asText()).isEqualTo("MORE_INFO");
+        assertThat(outboxColumn(id, "event_type")).containsExactly("CREATED", "CLAIMED", "REQUEST_INFO");
+    }
+
+    @Test
+    void mcpDecideKeepsSeparationOfDutiesAndRoles() throws Exception {
+        var both = user("mcp4-dual@acme.test", "/acme/applicant", "/acme/approver");
+        String own = createTicket(both, "acme", "my own ticket");
+        assertThat(errorText(mcp(both, "acme", "decide_ticket",
+                "{\"ticketId\":\"" + own + "\",\"decision\":\"APPROVE\",\"comment\":\"self\"}"))).startsWith("403 Forbidden");
+        assertThat(errorText(mcp(user("mcp4-app@acme.test", "/acme/applicant"), "acme", "decide_ticket",
+                "{\"ticketId\":\"" + own + "\",\"decision\":\"APPROVE\",\"comment\":\"x\"}"))).startsWith("403 Forbidden");
+        assertThat(errorText(mcp(user("mcp4-bob@acme.test", "/acme/approver"), "acme", "decide_ticket",
+                "{\"ticketId\":\"" + own + "\",\"decision\":\"APPROVE\",\"comment\":\"\"}")))
+                .isEqualTo("400 Bad Request: comment must not be blank");
+        assertThat(outboxCount(own, "true")).isEqualTo(1);                          // only CREATED: nothing changed
+    }
+
+    @Test
+    void mcpGetTicketReturnsOnlyTicketsTheCallerMayApprove() throws Exception {
+        var dual = user("mcp5-dual@acme.test", "/acme/applicant", "/acme/approver");
+        String own = createTicket(dual, "acme", "dual ticket");
+        String other = createTicket(user("mcp5-erin@acme.test", "/acme/applicant"), "acme", "erin ticket");
+
+        JsonNode found = mcp(dual, "acme", "get_ticket", "{\"ticketId\":\"" + other + "\"}");
+        assertThat(ticket(found).get("title").asText()).isEqualTo("erin ticket");
+        // Own ticket (separation of duties) and another tenant's ticket look like they do not exist.
+        assertThat(errorText(mcp(dual, "acme", "get_ticket", "{\"ticketId\":\"" + own + "\"}"))).startsWith("404 Not Found");
+        assertThat(errorText(mcp(user("mcp5-dave@globex.test", "/globex/approver"), "globex", "get_ticket",
+                "{\"ticketId\":\"" + other + "\"}"))).startsWith("404 Not Found");
+        // Applicants have no approval rights at all.
+        assertThat(errorText(mcp(user("mcp5-erin@acme.test", "/acme/applicant"), "acme", "get_ticket",
+                "{\"ticketId\":\"" + other + "\"}"))).startsWith("403 Forbidden");
+        assertThat(errorText(mcp(dual, "acme", "get_ticket", "{\"ticketId\":\"not-a-uuid\"}")))
+                .isEqualTo("400 Bad Request: ticketId must be a UUID");
     }
 }

@@ -83,7 +83,7 @@ See [guide 5](05-mtls-and-certificate-rotation.md) for the handshake step by ste
 
 | Control | Detail | Code |
 |---|---|---|
-| JWT verified again | signature (keys fetched from Keycloak over TLS), expiry, **issuer**, `typ=Bearer` (an ID token is refused), `azp=ticketing-ui` (tokens of other clients refused) | `JwtDecoderConfig.java` |
+| JWT verified again | signature (keys fetched from Keycloak over TLS), expiry, **issuer**, `typ=Bearer` (an ID token is refused), `azp` must be `ticketing-ui` or `ticketing-mcp` (tokens of other clients refused); `ticketing-mcp` tokens must also carry `aud=ticketing-api` | `JwtDecoderConfig.java` |
 | Tenant from the token only | memberships come from the token's `groups`; the `X-Tenant-ID` header only *selects* among tenants the token proves; email and tenant are never read from the request body | `TenantResolver.java`, `TenantContextFilter.java` |
 | Roles per tenant | `ROLE_APPLICANT` / `ROLE_APPROVER` are computed for the **active tenant only**; `@PreAuthorize` on every controller | `TicketController`, `ApprovalController` |
 | Defence in depth | `TicketService` re-checks the role itself, so a future controller cannot forget | `TicketService.java` |
@@ -93,6 +93,7 @@ See [guide 5](05-mtls-and-certificate-rotation.md) for the handshake step by ste
 | Concurrency safety | optimistic locking (`version`) stops two approvers both winning a race | `TicketWorkflow.java` |
 | Code boundaries | Java modules: the web layer cannot compile against database classes, so it cannot bypass `TicketService` | `module-info.java` files |
 | Request isolation | the tenant context is a per-request value that is always cleared at the end of the request | `TenantContextFilter.java` |
+| AI agents (MCP) | `/api/mcp` sits behind the same WAF rules, Kong route and filter chain as REST; tools call the same `TicketService` methods (roles, separation of duties) and the same validation; every history event records the channel (`REST`/`MCP`) next to the actor ([guide 10](10-mcp-integration.md)) | `TicketMcpTools.java` |
 
 ### ticket-service → databases
 

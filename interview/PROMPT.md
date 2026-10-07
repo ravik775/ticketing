@@ -70,8 +70,9 @@ tokens, Google brokering). cert-manager private CA, 90-day certs renewed at 60 d
 script. Default-deny NetworkPolicies in all namespaces. Former accepted gaps (now closed): demo passwords in the repository;
 Keycloak admin console reachable through the WAF. Since then: transactional outbox to MongoDB, per-tenant quotas and metering, OpenBao + External
 Secrets, WAL/oplog PITR backups with a restore drill, Prometheus/Loki/Tempo/Grafana with SLO burn-rate
-and SIEM alerts, Kubernetes and Keycloak audit, GitHub Actions CI/CD. Tests: 43 Java tests incl.
-Testcontainers (0 skipped), 56 live end-to-end checks; measured baseline 36.6 req/s, p95 109 ms.
+and SIEM alerts, Kubernetes and Keycloak audit, GitHub Actions CI/CD, an MCP endpoint for AI agents
+(/api/mcp, user-delegated tokens, atomic claimAndDecide, REST/MCP channel in the history). Tests: 50 Java tests incl.
+Testcontainers (0 skipped), 79 live end-to-end checks; measured baseline 36.6 req/s, p95 109 ms.
 
 INTERVIEW FORMAT
 - Duration: [120] minutes, [8] rounds. Default rounds, in this order:

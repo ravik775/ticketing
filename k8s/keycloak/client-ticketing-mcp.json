@@ -1,0 +1,56 @@
+{
+  "clientId": "ticketing-mcp",
+  "name": "Ticketing MCP (AI agents)",
+  "description": "OAuth client for MCP clients (Claude, IDE agents) calling /api/mcp on behalf of a signed-in user. Public client, Authorization Code + PKCE, user consent required, tokens carry aud=ticketing-api.",
+  "enabled": true,
+  "publicClient": true,
+  "protocol": "openid-connect",
+  "standardFlowEnabled": true,
+  "directAccessGrantsEnabled": false,
+  "implicitFlowEnabled": false,
+  "serviceAccountsEnabled": false,
+  "consentRequired": true,
+  "redirectUris": [
+    "http://localhost:*",
+    "http://127.0.0.1:*"
+  ],
+  "webOrigins": [],
+  "attributes": {
+    "pkce.code.challenge.method": "S256",
+    "post.logout.redirect.uris": "http://localhost:*##http://127.0.0.1:*",
+    "display.on.consent.screen": "true",
+    "consent.screen.text": "An AI assistant will act as you in the ticketing system: raise tickets and approve, reject or request information, with your roles."
+  },
+  "defaultClientScopes": [
+    "basic",
+    "profile",
+    "roles",
+    "email"
+  ],
+  "protocolMappers": [
+    {
+      "name": "tenant-groups",
+      "protocol": "openid-connect",
+      "protocolMapper": "oidc-group-membership-mapper",
+      "consentRequired": false,
+      "config": {
+        "full.path": "true",
+        "claim.name": "groups",
+        "id.token.claim": "false",
+        "access.token.claim": "true",
+        "userinfo.token.claim": "false"
+      }
+    },
+    {
+      "name": "audience-ticketing-api",
+      "protocol": "openid-connect",
+      "protocolMapper": "oidc-audience-mapper",
+      "consentRequired": false,
+      "config": {
+        "included.custom.audience": "ticketing-api",
+        "access.token.claim": "true",
+        "id.token.claim": "false"
+      }
+    }
+  ]
+}

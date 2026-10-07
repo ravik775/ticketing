@@ -4,9 +4,12 @@ import com.ticketing.core.TicketForbiddenException;
 import com.ticketing.core.TicketNotFoundException;
 import com.ticketing.core.TicketStatus;
 import com.ticketing.core.internal.OutboxStore.OutboxEvent;
+import com.ticketing.security.AccessChannel;
 import com.ticketing.security.TenantContext;
 import com.ticketing.security.TenantContextHolder;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 import java.util.function.Function;
@@ -31,8 +34,13 @@ public class WorkflowStore {
     public record EventSpec(String type, String comment) {
     }
 
-    /** The updated row together with the outbox event committed with it. */
-    public record Change(TicketWorkflow workflow, OutboxEvent event) {
+    /** The updated row together with the outbox event(s) committed with it, in the order they happened. */
+    public record Change(TicketWorkflow workflow, List<OutboxEvent> events) {
+
+        /** The last event (for single-step changes: the only one). */
+        public OutboxEvent event() {
+            return events.get(events.size() - 1);
+        }
     }
 
     private final WorkflowRepository repository;
@@ -63,9 +71,10 @@ public class WorkflowStore {
         }
         TicketWorkflow workflow = repository.saveAndFlush(new TicketWorkflow(id, ctx.tenantId(), ctx.email()));
         OutboxEvent event = new OutboxEvent(UUID.randomUUID(), ctx.tenantId(), id, workflow.getVersion(), "CREATED",
-                ctx.email(), null, details.title(), details.mobile(), details.description(), workflow.getCreatedAt(), 0);
+                ctx.email(), AccessChannel.current().name(), null, details.title(), details.mobile(),
+                details.description(), workflow.getCreatedAt(), 0);
         outbox.append(event);
-        return new Change(workflow, event);
+        return new Change(workflow, List.of(event));
     }
 
     @Transactional(readOnly = true)
@@ -89,20 +98,35 @@ public class WorkflowStore {
                 : repository.findByStatusOrderByCreatedAtDescIdAsc(statusOrNull, request);
     }
 
-    /**
-     * Load, apply a state transition, flush (so @Version conflicts surface here), then write the
-     * history event to the outbox, all in one transaction.
-     */
+    /** A single-step state transition; see {@link #updateAll}. */
     @Transactional
     public Change update(UUID id, Function<TicketWorkflow, EventSpec> transition) {
+        return updateAll(id, w -> List.of(transition.apply(w)));
+    }
+
+    /**
+     * Load, apply one or more state transitions, flush (so @Version conflicts surface here), then write one
+     * history event per step to the outbox, all in ONE transaction: either every step happens or none.
+     * Steps get strictly increasing timestamps (1 microsecond apart, PostgreSQL's precision) so the relay
+     * and the history show them in the order they ran.
+     */
+    @Transactional
+    public Change updateAll(UUID id, Function<TicketWorkflow, List<EventSpec>> transitions) {
         TenantContext ctx = bindTenant();
         TicketWorkflow workflow = repository.findById(id)
                 .orElseThrow(() -> new TicketNotFoundException("Ticket not found"));
-        EventSpec spec = transition.apply(workflow);
+        List<EventSpec> specs = transitions.apply(workflow);
         TicketWorkflow saved = repository.saveAndFlush(workflow);
-        OutboxEvent event = new OutboxEvent(UUID.randomUUID(), ctx.tenantId(), id, saved.getVersion(), spec.type(),
-                ctx.email(), spec.comment(), null, null, null, Instant.now(), 0);
-        outbox.append(event);
-        return new Change(saved, event);
+        Instant at = Instant.now().truncatedTo(ChronoUnit.MICROS);
+        String channel = AccessChannel.current().name();
+        List<OutboxEvent> events = new ArrayList<>(specs.size());
+        for (int i = 0; i < specs.size(); i++) {
+            EventSpec spec = specs.get(i);
+            OutboxEvent event = new OutboxEvent(UUID.randomUUID(), ctx.tenantId(), id, saved.getVersion(), spec.type(),
+                    ctx.email(), channel, spec.comment(), null, null, null, at.plus(i, ChronoUnit.MICROS), 0);
+            outbox.append(event);
+            events.add(event);
+        }
+        return new Change(saved, List.copyOf(events));
     }
 }

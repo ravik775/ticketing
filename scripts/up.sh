@@ -5,7 +5,7 @@
 # Order matters:
 #   cluster -> Kubernetes audit logging -> build -> cert-manager -> External Secrets -> PKI + OpenBao
 #   -> secrets bootstrap (random credentials, never in Git) -> everything else -> gateway config
-#   -> Keycloak audit events
+#   -> Keycloak audit events -> Keycloak MCP client
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -65,6 +65,9 @@ bash scripts/render-kong.sh
 
 echo "==> Keycloak audit events (ticketing + master realms)"
 bash scripts/configure-keycloak-audit.sh
+
+echo "==> Keycloak OAuth client for MCP clients (AI agents)"
+bash scripts/configure-keycloak-mcp.sh
 
 cat <<MSG
 

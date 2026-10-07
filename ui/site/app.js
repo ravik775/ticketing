@@ -240,7 +240,7 @@ function ticketCard(t, actions) {
     h('p', {}, t.description ?? ''),
     t.lockedBy ? h('div', { class: 'meta' }, `Locked by ${t.lockedBy} since ${when(t.lockedAt)}`) : null,
     h('ul', { class: 'events' }, (t.events || []).map((e) =>
-      h('li', {}, `${when(e.at)} · ${e.type} by ${e.actor}${e.comment ? ': ' + e.comment : ''}`))),
+      h('li', {}, `${when(e.at)} · ${e.type} by ${e.actor}${e.channel ? ' via ' + e.channel : ''}${e.comment ? ': ' + e.comment : ''}`))),
     actions);
 }
 

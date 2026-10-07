@@ -6,7 +6,8 @@
 # Safe to re-run (e.g. after recreating the Keycloak realm); it restarts Kong to pick up changes.
 set -euo pipefail
 
-ISSUER="https://ticketing.localtest.me:8443/auth/realms/ticketing"
+PUBLIC_BASE="https://ticketing.localtest.me:8443"
+ISSUER="${PUBLIC_BASE}/auth/realms/ticketing"
 WORK="$(mktemp -d)"
 trap 'kill "${PF_PID:-0}" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
@@ -127,6 +128,32 @@ services:
             config: {allowed_payload_size: 1}
           - name: correlation-id
             config: {header_name: X-Correlation-ID, generator: uuid, echo_downstream: true}
+          # MCP authorization (RFC 9728): a 401 on the MCP endpoint tells MCP clients where to find the
+          # protected-resource metadata, from which they discover Keycloak and start the OAuth flow.
+          # /api/mcp is otherwise secured by exactly the plugins above (same route as REST).
+          - name: post-function
+            config:
+              header_filter:
+                - |
+                  if kong.response.get_status() == 401 and kong.request.get_path() == "/api/mcp" then
+                    local hint = 'resource_metadata="${PUBLIC_BASE}/.well-known/oauth-protected-resource/api/mcp"'
+                    local existing = kong.response.get_header("WWW-Authenticate")
+                    kong.response.set_header("WWW-Authenticate",
+                      existing and (existing .. ", " .. hint) or ("Bearer " .. hint))
+                  end
+      # Protected-resource metadata for MCP clients (RFC 9728), answered by Kong itself; public, read-only.
+      # The prefix also matches the path-specific form /.well-known/oauth-protected-resource/api/mcp.
+      - name: mcp-protected-resource-metadata
+        paths: ["/.well-known/oauth-protected-resource"]
+        strip_path: false
+        protocols: ["https"]
+        methods: ["GET", "HEAD"]
+        plugins:
+          - name: request-termination
+            config:
+              status_code: 200
+              content_type: application/json
+              body: '{"resource":"${PUBLIC_BASE}/api/mcp","authorization_servers":["${ISSUER}"],"bearer_methods_supported":["header"],"scopes_supported":["openid","profile","email"],"resource_name":"Ticketing MCP server"}'
 
   # ---- Identity provider (public: login pages, token + JWKS endpoints) -------------------------
   - name: keycloak
